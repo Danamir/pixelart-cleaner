@@ -175,11 +175,8 @@ def _subdivide_spans(
     target_size: float,
 ) -> list[tuple[int, int]]:
     """
-    Split each span into sub-spans of approximately target_size pixels.
-
-    Used to apply --scale in irregular mode: each detected virtual-pixel span
-    is divided into round(span_size / target_size) equal sub-spans so that
-    the output pixel count matches the scaled resolution.
+    Split each span into round(size / target_size) equal sub-spans.
+    Used when scale > 1.0 (target_size < natural span size).
     """
     result = []
     for s, e in spans:
@@ -190,6 +187,22 @@ def _subdivide_spans(
             sub_e = round(s + (i + 1) * step)
             if sub_e > sub_s:
                 result.append((sub_s, sub_e))
+    return result
+
+
+def _merge_spans(
+    spans: list[tuple[int, int]],
+    group_size: int,
+) -> list[tuple[int, int]]:
+    """
+    Merge consecutive spans in batches of group_size into a single span.
+    Used when scale < 1.0 (group_size = round(1 / scale) virtual pixels
+    should map to one output pixel).
+    """
+    result = []
+    for i in range(0, len(spans), group_size):
+        batch = spans[i : i + group_size]
+        result.append((batch[0][0], batch[-1][1]))
     return result
 
 
@@ -285,6 +298,7 @@ def _downsample_tiled(
     edge_percentile: float,
     sample_method: str,
     use_regular: bool,
+    scale: float = 1.0,
 ) -> Image.Image:
     """
     Downsample by processing the image in tiles.
@@ -341,6 +355,14 @@ def _downsample_tiled(
                 # its center to avoid double-counting at tile boundaries.
                 t_row_spans = _spans_in_tile(global_row_spans, r0, r1)
                 t_col_spans = _spans_in_tile(global_col_spans, c0, c1)
+                if scale != 1.0:
+                    if scale > 1.0:
+                        t_row_spans = _subdivide_spans(t_row_spans, pixel_h)
+                        t_col_spans = _subdivide_spans(t_col_spans, pixel_w)
+                    else:
+                        g = max(1, round(1.0 / scale))
+                        t_row_spans = _merge_spans(t_row_spans, g)
+                        t_col_spans = _merge_spans(t_col_spans, g)
                 tile_out = np.array(
                     _downsample_irregular(tile_arr, t_row_spans, t_col_spans, sample_method)
                 )
@@ -536,7 +558,7 @@ def process_file(
         strategy = ("regular" if use_regular else f"irregular span {sample_method}") + tile_suffix
         out_img = _downsample_tiled(
             arr, pixel_w, pixel_h, col_breaks, row_breaks,
-            tw, th, edge_percentile, sample_method, use_regular,
+            tw, th, edge_percentile, sample_method, use_regular, scale,
         )
     elif use_regular:
         strategy = "regular (nearest-neighbour at grid centers)"
@@ -552,9 +574,15 @@ def process_file(
         row_spans = _breaks_to_spans(row_breaks, H)
         col_spans = _breaks_to_spans(col_breaks, W)
         if scale != 1.0 and pixel_h is not None:
-            row_spans = _subdivide_spans(row_spans, pixel_h)
+            if scale > 1.0:
+                row_spans = _subdivide_spans(row_spans, pixel_h)
+            else:
+                row_spans = _merge_spans(row_spans, max(1, round(1.0 / scale)))
         if scale != 1.0 and pixel_w is not None:
-            col_spans = _subdivide_spans(col_spans, pixel_w)
+            if scale > 1.0:
+                col_spans = _subdivide_spans(col_spans, pixel_w)
+            else:
+                col_spans = _merge_spans(col_spans, max(1, round(1.0 / scale)))
         if len(row_spans) != art_h:
             print(f"  Warning: {len(row_spans)} row spans detected, expected {art_h}")
         if len(col_spans) != art_w:
