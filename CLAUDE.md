@@ -263,6 +263,36 @@ venv/Scripts/python.exe resize.py image.png -i -q -g 3.0
 
 ---
 
+## Debug
+
+- File `test.local/test.png` , 64x64 image with 5x5 virtual pixels forming this shape. Should register 8 true rows, 6 true cols : 
+```
+
+    ##
+   #xx#
+  #xxxx#
+  #xxxx#
+   #xx#
+    ##
+
+  xxxxxx
+
+
+```
+
+- File `test.local/test-line.png` , 1152x36 image extacted from an AI generated one, with approximate 5x5 virtual pixels forming this shape. Should register 4 true rows, 8 true cols : 
+```
+
+       
+          ######!
+        ##xxxxxxx!##
+     ##!xxxxxxxxxxxx##
+    #xxxxxxxxxxxxxxxxx#
+```
+
+
+---
+
 ## Troubleshooting
 
 | Problem | Likely cause | Fix |
