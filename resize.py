@@ -20,7 +20,7 @@ In addition to the downsampled pixel-art output, two comparison images are saved
 
 Usage:
     resize.py <input>... [--output=PATH] [--edge-percentile=P] [--sample=METHOD]
-              [-r | -i] [-s S] [-t SIZE] [-v]
+              [-r | -i] [-s S] [-t SIZE] [-q] [-v]
     resize.py -h | --help
 
 Arguments:
@@ -35,6 +35,7 @@ Options:
     -s S --scale=S              Divide detected virtual pixel size by S before resampling [default: 1.0].
     -t SIZE --tile=SIZE         Split image into tiles of SIZE (e.g. 64x64) and detect each independently.
                                 The global period is kept; only the phase is corrected per tile.
+    -q --square                 Force square virtual pixels by averaging detected width and height.
     -v --verbose                Also save _edges.png, _compare.png, and _compare_true.png.
     -h --help                   Show this screen.
 """
@@ -299,6 +300,7 @@ def _downsample_tiled(
     sample_method: str,
     use_regular: bool,
     scale: float = 1.0,
+    square: bool = False,
 ) -> Image.Image:
     """
     Downsample by processing the image in tiles.
@@ -355,8 +357,8 @@ def _downsample_tiled(
                 # its center to avoid double-counting at tile boundaries.
                 t_row_spans = _spans_in_tile(global_row_spans, r0, r1)
                 t_col_spans = _spans_in_tile(global_col_spans, c0, c1)
-                if scale != 1.0:
-                    if scale > 1.0:
+                if scale != 1.0 or square:
+                    if scale >= 1.0:
                         t_row_spans = _subdivide_spans(t_row_spans, pixel_h)
                         t_col_spans = _subdivide_spans(t_col_spans, pixel_w)
                     else:
@@ -443,6 +445,7 @@ def _flags_suffix(
     force_irregular: bool,
     scale: float,
     tile_size: tuple[int, int] | None,
+    square: bool = False,
 ) -> str:
     """
     Build a filename suffix encoding the active non-default options, e.g.
@@ -454,6 +457,8 @@ def _flags_suffix(
         parts.append("r")
     if force_irregular:
         parts.append("i")
+    if square:
+        parts.append("q")
     if scale != 1.0:
         parts.append(f"s{scale}")
     if tile_size is not None:
@@ -504,6 +509,7 @@ def process_file(
     verbose: bool,
     tile_size: tuple[int, int] | None = None,
     flags_suffix: str = "",
+    square: bool = False,
 ) -> None:
     print(f"Loading: {input_path}")
     img, arr = load_image(str(input_path))
@@ -530,6 +536,9 @@ def process_file(
     else:
         pixel_w /= scale
         pixel_h /= scale
+        if square:
+            avg = (pixel_w + pixel_h) / 2.0
+            pixel_w = pixel_h = avg
         art_w = max(1, round(W / pixel_w))
         art_h = max(1, round(H / pixel_h))
         print(f"  Virtual pixel size : {pixel_w:.2f} x {pixel_h:.2f} px"
@@ -558,7 +567,7 @@ def process_file(
         strategy = ("regular" if use_regular else f"irregular span {sample_method}") + tile_suffix
         out_img = _downsample_tiled(
             arr, pixel_w, pixel_h, col_breaks, row_breaks,
-            tw, th, edge_percentile, sample_method, use_regular, scale,
+            tw, th, edge_percentile, sample_method, use_regular, scale, square,
         )
     elif use_regular:
         strategy = "regular (nearest-neighbour at grid centers)"
@@ -573,13 +582,13 @@ def process_file(
         strategy = f"irregular (span {sample_method} sampling)"
         row_spans = _breaks_to_spans(row_breaks, H)
         col_spans = _breaks_to_spans(col_breaks, W)
-        if scale != 1.0 and pixel_h is not None:
-            if scale > 1.0:
+        if (scale != 1.0 or square) and pixel_h is not None:
+            if scale >= 1.0:
                 row_spans = _subdivide_spans(row_spans, pixel_h)
             else:
                 row_spans = _merge_spans(row_spans, max(1, round(1.0 / scale)))
-        if scale != 1.0 and pixel_w is not None:
-            if scale > 1.0:
+        if (scale != 1.0 or square) and pixel_w is not None:
+            if scale >= 1.0:
                 col_spans = _subdivide_spans(col_spans, pixel_w)
             else:
                 col_spans = _merge_spans(col_spans, max(1, round(1.0 / scale)))
@@ -627,6 +636,7 @@ def main() -> None:
     sample_method   = args["--sample"]
     force_regular   = args["--force-regular"]
     force_irregular = args["--force-irregular"]
+    square          = args["--square"]
     verbose         = args["--verbose"]
     scale           = float(args["--scale"])
     tile_size       = None
@@ -655,7 +665,7 @@ def main() -> None:
             print(f"Error: file not found: {p}", file=sys.stderr)
         sys.exit(1)
 
-    suffix = _flags_suffix(force_regular, force_irregular, scale, tile_size) if verbose else ""
+    suffix = _flags_suffix(force_regular, force_irregular, scale, tile_size, square) if verbose else ""
 
     for input_path in input_paths:
         output_path = Path(output_arg) if output_arg else (
@@ -668,6 +678,7 @@ def main() -> None:
             scale, verbose,
             tile_size,
             suffix,
+            square,
         )
 
 
