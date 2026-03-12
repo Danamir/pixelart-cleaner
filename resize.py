@@ -259,6 +259,41 @@ def _downsample_irregular(
     return Image.fromarray(out)
 
 
+def _downsample_square_padded(
+    arr: np.ndarray,
+    row_spans: list[tuple[int, int]],
+    col_spans: list[tuple[int, int]],
+    target_size: float,
+    method: str,
+) -> Image.Image:
+    """
+    Reconstruct with square-looking output pixels by padding rectangular spans.
+
+    Each virtual pixel is sampled once.  Its colour is then repeated
+    round(span_size / target_size) times along each axis so that every output
+    pixel represents approximately a target_size x target_size source region.
+
+    Wide spans (e.g. preserved by --max-gap) produce several identical columns;
+    tall spans produce several identical rows.  No independent sub-sampling is
+    done, so no extra edge artefacts appear within a single virtual pixel.
+    """
+    row_reps = [max(1, round((e - s) / target_size)) for s, e in row_spans]
+    col_reps = [max(1, round((e - s) / target_size)) for s, e in col_spans]
+    H_out = sum(row_reps)
+    W_out = sum(col_reps)
+    out = np.zeros((H_out, W_out, 3), dtype=np.uint8)
+    ri_out = 0
+    for ri, (r0, r1) in enumerate(row_spans):
+        nr = row_reps[ri]
+        ci_out = 0
+        for ci, (c0, c1) in enumerate(col_spans):
+            color = _sample_block(arr, r0, r1, c0, c1, method)
+            out[ri_out:ri_out + nr, ci_out:ci_out + col_reps[ci]] = color
+            ci_out += col_reps[ci]
+        ri_out += nr
+    return Image.fromarray(out)
+
+
 def _downsample_regular(
     arr: np.ndarray,
     row_centers: list[int],
@@ -316,6 +351,8 @@ def _downsample_tiled(
     use_regular: bool,
     scale: float = 1.0,
     square: bool = False,
+    raw_pixel_w: float | None = None,
+    raw_pixel_h: float | None = None,
 ) -> Image.Image:
     """
     Downsample by processing the image in tiles.
@@ -372,10 +409,12 @@ def _downsample_tiled(
                 # its center to avoid double-counting at tile boundaries.
                 t_row_spans = _spans_in_tile(global_row_spans, r0, r1)
                 t_col_spans = _spans_in_tile(global_col_spans, c0, c1)
-                if scale != 1.0 or square:
-                    if scale >= 1.0:
-                        t_row_spans = _subdivide_spans(t_row_spans, pixel_h)
-                        t_col_spans = _subdivide_spans(t_col_spans, pixel_w)
+                _pw = raw_pixel_w if raw_pixel_w is not None else pixel_w
+                _ph = raw_pixel_h if raw_pixel_h is not None else pixel_h
+                if scale != 1.0:
+                    if scale > 1.0:
+                        t_row_spans = _subdivide_spans(t_row_spans, _ph)
+                        t_col_spans = _subdivide_spans(t_col_spans, _pw)
                     else:
                         g = max(1, round(1.0 / scale))
                         t_row_spans = _merge_spans(t_row_spans, g)
@@ -544,6 +583,7 @@ def process_file(
         mag_h, mag_v, edge_percentile, max_gap_ratio
     )
 
+    raw_pixel_w = raw_pixel_h = None
     if pixel_w is None or pixel_h is None:
         if force_regular:
             print(
@@ -558,6 +598,7 @@ def process_file(
     else:
         pixel_w /= scale
         pixel_h /= scale
+        raw_pixel_w, raw_pixel_h = pixel_w, pixel_h   # save before squaring
         if square:
             avg = (pixel_w + pixel_h) / 2.0
             pixel_w = pixel_h = avg
@@ -590,6 +631,7 @@ def process_file(
         out_img = _downsample_tiled(
             arr, pixel_w, pixel_h, col_breaks, row_breaks,
             tw, th, edge_percentile, sample_method, use_regular, scale, square,
+            raw_pixel_w, raw_pixel_h,
         )
         # Effective breaks for edge overlay: derive from global grid (tiling only adjusts phase)
         if use_regular:
@@ -598,14 +640,15 @@ def process_file(
         else:
             eff_row_spans = _breaks_to_spans(row_breaks, H)
             eff_col_spans = _breaks_to_spans(col_breaks, W)
-            if (scale != 1.0 or square) and pixel_h is not None:
-                if scale >= 1.0:
-                    eff_row_spans = _subdivide_spans(eff_row_spans, pixel_h)
+            _pw, _ph = raw_pixel_w, raw_pixel_h
+            if scale != 1.0 and _ph is not None:
+                if scale > 1.0:
+                    eff_row_spans = _subdivide_spans(eff_row_spans, _ph)
                 else:
                     eff_row_spans = _merge_spans(eff_row_spans, max(1, round(1.0 / scale)))
-            if (scale != 1.0 or square) and pixel_w is not None:
-                if scale >= 1.0:
-                    eff_col_spans = _subdivide_spans(eff_col_spans, pixel_w)
+            if scale != 1.0 and _pw is not None:
+                if scale > 1.0:
+                    eff_col_spans = _subdivide_spans(eff_col_spans, _pw)
                 else:
                     eff_col_spans = _merge_spans(eff_col_spans, max(1, round(1.0 / scale)))
             eff_row_breaks = _spans_to_breaks(eff_row_spans)
@@ -625,23 +668,28 @@ def process_file(
         strategy = f"irregular (span {sample_method} sampling)"
         row_spans = _breaks_to_spans(row_breaks, H)
         col_spans = _breaks_to_spans(col_breaks, W)
-        if (scale != 1.0 or square) and pixel_h is not None:
-            if scale >= 1.0:
-                row_spans = _subdivide_spans(row_spans, pixel_h)
+        _pw, _ph = raw_pixel_w, raw_pixel_h
+        if scale != 1.0 and _ph is not None:
+            if scale > 1.0:
+                row_spans = _subdivide_spans(row_spans, _ph)
             else:
                 row_spans = _merge_spans(row_spans, max(1, round(1.0 / scale)))
-        if (scale != 1.0 or square) and pixel_w is not None:
-            if scale >= 1.0:
-                col_spans = _subdivide_spans(col_spans, pixel_w)
+        if scale != 1.0 and _pw is not None:
+            if scale > 1.0:
+                col_spans = _subdivide_spans(col_spans, _pw)
             else:
                 col_spans = _merge_spans(col_spans, max(1, round(1.0 / scale)))
-        if len(row_spans) != art_h:
-            print(f"  Warning: {len(row_spans)} row spans detected, expected {art_h}")
-        if len(col_spans) != art_w:
-            print(f"  Warning: {len(col_spans)} col spans detected, expected {art_w}")
-        out_img = _downsample_irregular(arr, row_spans, col_spans, sample_method)
         eff_row_breaks = _spans_to_breaks(row_spans)
         eff_col_breaks = _spans_to_breaks(col_spans)
+        if square and _pw is not None and _ph is not None:
+            target_size = min(_pw, _ph)
+            out_img = _downsample_square_padded(arr, row_spans, col_spans, target_size, sample_method)
+        else:
+            if len(row_spans) != art_h:
+                print(f"  Warning: {len(row_spans)} row spans detected, expected {art_h}")
+            if len(col_spans) != art_w:
+                print(f"  Warning: {len(col_spans)} col spans detected, expected {art_w}")
+            out_img = _downsample_irregular(arr, row_spans, col_spans, sample_method)
 
     W_out, H_out = out_img.size
     compare_true_scale = max(1, round(min(W / W_out, H / H_out)))
