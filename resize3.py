@@ -23,7 +23,7 @@ Options:
     -i --force-irregular        Always use irregular span strategy.
     -s S --scale=S              Divide detected pixel size by S (S>1 finer, S<1 coarser) [default: 1.0].
     -t SIZE --tile=SIZE         Process in independent tiles, e.g. 64x64.
-    -m METHOD --sample=METHOD   Color sampling method: center, center_region [default: center].
+    -m METHOD --sample=METHOD   Color sampling method: center, center_region, max [default: center].
     -q --square                 Force square output pixels.
     -v --verbose                Also save _edges3, _compare3, _compare3_true images.
     -h --help                   Show this screen.
@@ -54,6 +54,24 @@ def _sample_center(block: np.ndarray) -> np.ndarray:
     return block[h // 2, w // 2].astype(np.float32)
 
 
+def _sample_max(block: np.ndarray, n_buckets: int = 10) -> np.ndarray:
+    """
+    Return the mean color of the dominant color cluster in the block.
+
+    Quantizes each RGB channel into n_buckets levels, finds the bucket
+    (channel triplet) with the most pixels, then returns the mean of the
+    actual (unquantized) pixels belonging to that bucket.  This is robust
+    to the slight per-pixel color variation typical in AI-generated pixel art.
+    """
+    pixels = block.reshape(-1, 3)
+    step = max(1, round(256 / n_buckets))
+    quantized = (pixels // step).astype(np.int32)
+    keys, counts = np.unique(quantized, axis=0, return_counts=True)
+    best = keys[counts.argmax()]
+    mask = np.all(quantized == best, axis=1)
+    return pixels[mask].mean(axis=0)
+
+
 def _sample_center_region(block: np.ndarray) -> np.ndarray:
     """
     Return the mean color of the inner 50% of an RGB block (H, W, 3).
@@ -75,6 +93,8 @@ def sample_block(block: np.ndarray, method: str = "center") -> np.ndarray:
     """Dispatch to the chosen sampling method."""
     if method == "center_region":
         return _sample_center_region(block)
+    if method == "max":
+        return _sample_max(block)
     return _sample_center(block)
 
 
@@ -414,7 +434,7 @@ def main() -> None:
     verbose = args["--verbose"]
     tile_size = args["--tile"]
 
-    valid_methods = {"center", "center_region"}
+    valid_methods = {"center", "center_region", "max"}
     if method not in valid_methods:
         print(f"Error: --sample must be one of: {', '.join(sorted(valid_methods))}", file=sys.stderr)
         sys.exit(1)
