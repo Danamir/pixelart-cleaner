@@ -20,7 +20,7 @@ In addition to the downsampled pixel-art output, two comparison images are saved
 
 Usage:
     resize.py <input>... [--output=PATH] [--edge-percentile=P] [--sample=METHOD]
-              [--force-regular | --force-irregular] [--scale=S] [-v]
+              [--force-regular | --force-irregular] [--scale=S] [--tile=SIZE] [-v]
     resize.py -h | --help
 
 Arguments:
@@ -33,6 +33,8 @@ Options:
     --force-regular             Force regular-grid strategy regardless of detection quality.
     --force-irregular           Force irregular span-based strategy regardless of detection quality.
     --scale=S                   Divide detected virtual pixel size by S before resampling [default: 1.0].
+    --tile=SIZE                 Split image into tiles of SIZE (e.g. 64x64) and detect each independently.
+                                The global period is kept; only the phase is corrected per tile.
     -v --verbose                Also save _edges.png, _compare.png, and _compare_true.png.
     -h --help                   Show this screen.
 """
@@ -50,6 +52,29 @@ from detect import load_image, compute_gradients, detect_pixel_grid, make_grid_o
 # ---------------------------------------------------------------------------
 # Span construction
 # ---------------------------------------------------------------------------
+
+def _spans_in_tile(
+    global_spans: list[tuple[int, int]],
+    t0: int,
+    t1: int,
+) -> list[tuple[int, int]]:
+    """
+    Return the subset of global spans whose CENTER falls in [t0, t1), clipped
+    to [t0, t1) and shifted to tile-local coordinates.
+
+    Attributing spans by center guarantees each span belongs to exactly one
+    tile even when it straddles a tile boundary, so span counts sum correctly
+    across tiles.
+    """
+    result = []
+    for s, e in global_spans:
+        if t0 <= (s + e) / 2 < t1:
+            local_s = max(s, t0) - t0
+            local_e = min(e, t1) - t0
+            if local_e > local_s:
+                result.append((local_s, local_e))
+    return result
+
 
 def _breaks_to_spans(breaks: np.ndarray, image_length: int) -> list[tuple[int, int]]:
     """
@@ -193,6 +218,153 @@ def _downsample_regular(
 
 
 # ---------------------------------------------------------------------------
+# Tiled downsampling
+# ---------------------------------------------------------------------------
+
+def _parse_tile_size(s: str) -> tuple[int, int]:
+    """Parse a 'WxH' tile size string into (width, height) integers."""
+    try:
+        w, h = s.lower().split("x")
+        return int(w), int(h)
+    except Exception:
+        raise ValueError(f"Invalid tile size {s!r} — expected format: WxH (e.g. 64x64)")
+
+
+def _pad_tile(tile: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    """
+    Pad a tile array to (target_h, target_w) by repeating edge pixels.
+
+    Also trims to the target if the tile is somehow larger (shouldn't happen
+    in normal use but guards against rounding edge cases).
+    """
+    h, w = tile.shape[:2]
+    if h < target_h:
+        pad = np.repeat(tile[-1:, :], target_h - h, axis=0)
+        tile = np.concatenate([tile, pad], axis=0)
+    if w < target_w:
+        pad = np.repeat(tile[:, -1:], target_w - w, axis=1)
+        tile = np.concatenate([tile, pad], axis=1)
+    return tile[:target_h, :target_w]
+
+
+def _downsample_tiled(
+    arr: np.ndarray,
+    pixel_w: float,
+    pixel_h: float,
+    col_breaks: np.ndarray,
+    row_breaks: np.ndarray,
+    tile_w: int,
+    tile_h: int,
+    edge_percentile: float,
+    sample_method: str,
+    use_regular: bool,
+) -> Image.Image:
+    """
+    Downsample by processing the image in tiles.
+
+    Two-pass algorithm:
+      Pass 1 -- sample every tile independently (local phase correction for
+                regular mode; local span detection for irregular mode).
+      Pass 2 -- determine the canonical output size per strip, pad tiles that
+                came out short, and concatenate.
+
+    Canonical size per strip:
+      regular   -- count of global output centers falling in that strip's input
+                   range (guarantees exact art_w x art_h total).
+      irregular -- maximum output size across all tiles in the strip (no global
+                   reference exists; padding fills tiles where detection missed
+                   a span).
+    """
+    H, W = arr.shape[:2]
+
+    tile_row_starts = list(range(0, H, tile_h))
+    tile_col_starts = list(range(0, W, tile_w))
+
+    # Pre-compute global spans for irregular mode (used in pass 1)
+    global_row_spans = _breaks_to_spans(row_breaks, H) if not use_regular else None
+    global_col_spans = _breaks_to_spans(col_breaks, W) if not use_regular else None
+
+    # --- Pass 1: sample every tile ---
+    tile_grid: list[list[np.ndarray]] = []
+    for r0 in tile_row_starts:
+        r1 = min(r0 + tile_h, H)
+        th = r1 - r0
+        row: list[np.ndarray] = []
+        for c0 in tile_col_starts:
+            c1 = min(c0 + tile_w, W)
+            tw = c1 - c0
+            tile_arr = arr[r0:r1, c0:c1]
+
+            if use_regular:
+                # Regular mode: local detection for phase correction;
+                # fall back to global breaks if the tile is featureless.
+                mag_h_t, mag_v_t = compute_gradients(tile_arr)
+                _, _, t_col_breaks, t_row_breaks = detect_pixel_grid(
+                    mag_h_t, mag_v_t, edge_percentile
+                )
+                if len(t_row_breaks) == 0:
+                    t_row_breaks = row_breaks[(row_breaks >= r0) & (row_breaks < r1)] - r0
+                if len(t_col_breaks) == 0:
+                    t_col_breaks = col_breaks[(col_breaks >= c0) & (col_breaks < c1)] - c0
+                row_centers = _regular_centers(pixel_h, th, t_row_breaks)
+                col_centers = _regular_centers(pixel_w, tw, t_col_breaks)
+                tile_out = np.array(_downsample_regular(tile_arr, row_centers, col_centers))
+            else:
+                # Irregular mode: attribute each global span to the tile containing
+                # its center to avoid double-counting at tile boundaries.
+                t_row_spans = _spans_in_tile(global_row_spans, r0, r1)
+                t_col_spans = _spans_in_tile(global_col_spans, c0, c1)
+                tile_out = np.array(
+                    _downsample_irregular(tile_arr, t_row_spans, t_col_spans, sample_method)
+                )
+
+            row.append(tile_out)
+        tile_grid.append(row)
+
+    n_tile_rows = len(tile_row_starts)
+    n_tile_cols = len(tile_col_starts)
+
+    # --- Pass 2: canonical sizes, pad, assemble ---
+    if use_regular:
+        # Use global grid to guarantee exact art_h x art_w total
+        global_row_centers = _regular_centers(pixel_h, H, row_breaks)
+        global_col_centers = _regular_centers(pixel_w, W, col_breaks)
+        canon_rows = [
+            sum(1 for rc in global_row_centers if r0 <= rc < min(r0 + tile_h, H))
+            for r0 in tile_row_starts
+        ]
+        canon_cols = [
+            sum(1 for cc in global_col_centers if c0 <= cc < min(c0 + tile_w, W))
+            for c0 in tile_col_starts
+        ]
+    else:
+        # No global reference: use the maximum output size within each strip
+        canon_rows = [
+            max(tile_grid[ri][ci].shape[0] for ci in range(n_tile_cols))
+            for ri in range(n_tile_rows)
+        ]
+        canon_cols = [
+            max(tile_grid[ri][ci].shape[1] for ri in range(n_tile_rows))
+            for ci in range(n_tile_cols)
+        ]
+
+    strip_list = []
+    for ri in range(n_tile_rows):
+        if canon_rows[ri] == 0:
+            continue
+        tile_row_out = []
+        for ci in range(n_tile_cols):
+            if canon_cols[ci] == 0:
+                continue
+            tile_out = _pad_tile(tile_grid[ri][ci], canon_rows[ri], canon_cols[ci])
+            tile_row_out.append(tile_out)
+        if tile_row_out:
+            strip_list.append(np.concatenate(tile_row_out, axis=1))
+
+    return Image.fromarray(np.concatenate(strip_list, axis=0))
+
+
+# ---------------------------------------------------------------------------
 # Comparison images
 # ---------------------------------------------------------------------------
 
@@ -254,6 +426,7 @@ def process_file(
     force_irregular: bool,
     scale: float,
     verbose: bool,
+    tile_size: tuple[int, int] | None = None,
 ) -> None:
     print(f"Loading: {input_path}")
     img, arr = load_image(str(input_path))
@@ -295,7 +468,22 @@ def process_file(
     if force_irregular:
         use_regular = False
 
-    if use_regular:
+    tile_suffix = ""
+    if tile_size is not None:
+        tw, th = tile_size
+        n_cols = -(-W // tw)  # ceil division
+        n_rows = -(-H // th)
+        tile_suffix = f" tiled {n_cols}x{n_rows}"
+        print(f"  Tiling: {n_cols} x {n_rows} tiles of {tw} x {th} px")
+
+    if tile_size is not None:
+        tw, th = tile_size
+        strategy = ("regular" if use_regular else f"irregular span {sample_method}") + tile_suffix
+        out_img = _downsample_tiled(
+            arr, pixel_w, pixel_h, col_breaks, row_breaks,
+            tw, th, edge_percentile, sample_method, use_regular,
+        )
+    elif use_regular:
         strategy = "regular (nearest-neighbour at grid centers)"
         row_centers = _regular_centers(pixel_h, H, row_breaks)
         col_centers = _regular_centers(pixel_w, W, col_breaks)
@@ -354,6 +542,13 @@ def main() -> None:
     force_irregular = args["--force-irregular"]
     verbose         = args["--verbose"]
     scale           = float(args["--scale"])
+    tile_size       = None
+    if args["--tile"]:
+        try:
+            tile_size = _parse_tile_size(args["--tile"])
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
     if scale <= 0:
         print("Error: --scale must be a positive number", file=sys.stderr)
@@ -382,6 +577,7 @@ def main() -> None:
             edge_percentile, sample_method,
             force_regular, force_irregular,
             scale, verbose,
+            tile_size,
         )
 
 

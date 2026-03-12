@@ -222,29 +222,60 @@ def estimate_pixel_period(
 def _fill_missing_breaks(
     positions: np.ndarray,
     period: float,
+    image_length: int,
     max_gap_ratio: float = 1.6,
 ) -> np.ndarray:
     """
     Insert synthetic breaks into gaps that are too wide for a single period.
 
-    Pixel art sizes never vary wildly: a gap of ~2x the period almost certainly
-    contains one missed break, a gap of ~3x contains two, etc.  Any gap wider
-    than max_gap_ratio * period is subdivided into round(gap / period) equal
-    intervals.
+    Handles three kinds of gaps:
+      - leading  : from the image start (pixel 0) to the first break
+      - internal : between consecutive detected breaks
+      - trailing : from the last break to the image end
+
+    A break at gradient-space position b means a pixel boundary at b+1.
+    The leading span size is therefore first_break + 1, and the trailing
+    span size is image_length - last_break - 1.
+
+    Any span wider than max_gap_ratio * period is subdivided into
+    round(span / period) equal intervals by inserting synthetic breaks.
     """
     filled = sorted(positions.tolist())
+
+    def _insert_breaks_in_span(span_start_px: float, span_size: float) -> list[float]:
+        """Return synthetic break positions (gradient space) for one oversized span."""
+        n_insert = round(span_size / period) - 1
+        if n_insert <= 0:
+            return []
+        step = span_size / (n_insert + 1)
+        # Boundary k is at pixel span_start_px + k*step; break = boundary - 1
+        return [span_start_px + step * (j + 1) - 1 for j in range(n_insert)]
+
+    # Leading edge
+    if filled:
+        leading_size = filled[0] + 1          # pixels in [0, first_break+1)
+        if leading_size > period * max_gap_ratio:
+            filled = _insert_breaks_in_span(0, leading_size) + filled
+
+    # Internal gaps
     i = 0
     while i < len(filled) - 1:
-        gap = filled[i + 1] - filled[i]
-        if gap > period * max_gap_ratio:
-            n_insert = round(gap / period) - 1
-            if n_insert > 0:
-                step = gap / (n_insert + 1)
-                new_breaks = [filled[i] + step * (j + 1) for j in range(n_insert)]
+        gap = filled[i + 1] - filled[i]       # gradient-space distance
+        span_size = gap                        # also equals pixel span size here
+        if span_size > period * max_gap_ratio:
+            new_breaks = _insert_breaks_in_span(filled[i] + 1, span_size)
+            if new_breaks:
                 filled = filled[:i + 1] + new_breaks + filled[i + 1:]
-                i += n_insert
+                i += len(new_breaks)
         i += 1
-    return np.array(filled)
+
+    # Trailing edge
+    if filled:
+        trailing_size = image_length - (filled[-1] + 1)   # pixels after last break
+        if trailing_size > period * max_gap_ratio:
+            filled = filled + _insert_breaks_in_span(filled[-1] + 1, trailing_size)
+
+    return np.array(sorted(filled))
 
 
 def _remove_close_breaks(positions: np.ndarray, period: float, min_ratio: float = 0.5) -> np.ndarray:
@@ -292,7 +323,7 @@ def detect_pixel_grid(
     pixel_h     = estimate_pixel_period(row_breaks, H)
     if pixel_h is not None:
         row_breaks = _remove_close_breaks(row_breaks, pixel_h)
-        row_breaks = _fill_missing_breaks(row_breaks, pixel_h)
+        row_breaks = _fill_missing_breaks(row_breaks, pixel_h, H)
 
     # Column breaks — peaks in fraction-of-active-rows voting for a horizontal edge at each col
     col_profile = compute_break_profile(mag_h, threshold_percentile, along_axis=0)
@@ -300,7 +331,7 @@ def detect_pixel_grid(
     pixel_w     = estimate_pixel_period(col_breaks, W)
     if pixel_w is not None:
         col_breaks = _remove_close_breaks(col_breaks, pixel_w)
-        col_breaks = _fill_missing_breaks(col_breaks, pixel_w)
+        col_breaks = _fill_missing_breaks(col_breaks, pixel_w, W)
 
     return pixel_w, pixel_h, col_breaks, row_breaks
 
