@@ -295,6 +295,10 @@ def _parse_tile_size(s: str) -> tuple[int, int]:
     return int(parts[0]), int(parts[1])
 
 
+_TileData = tuple[int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+# (row_offset, col_offset, col_breaks, row_breaks, col_synth, row_synth)
+
+
 def _downsample_tiled(
     arr: np.ndarray,
     tile_w: int,
@@ -310,19 +314,24 @@ def _downsample_tiled(
     method: str = "center",
     min_distance: int = 3,
     cluster_radius: int = 1,
-) -> np.ndarray:
+) -> tuple[np.ndarray, list[_TileData]]:
     """
     Split the image into tiles, downsample each independently, then assemble.
 
     Each tile gets its own grid detection, providing local phase correction.
     Tiles in the same row are padded to the same output height; tiles in the
     same column are padded to the same output width before concatenation.
+
+    Returns (out_arr, tiles_data) where tiles_data holds per-tile detection
+    results in local coordinates for building a tiled edges overlay.
     """
     H, W = arr.shape[:2]
     row_bounds = [(r, min(r + tile_h, H)) for r in range(0, H, tile_h)]
     col_bounds = [(c, min(c + tile_w, W)) for c in range(0, W, tile_w)]
 
     out_rows = []
+    tiles_data: list[_TileData] = []
+
     for r0, r1 in row_bounds:
         out_cols = []
         for c0, c1 in col_bounds:
@@ -333,6 +342,12 @@ def _downsample_tiled(
                 min_distance, cluster_radius,
             )
             out_cols.append(tile_out)
+
+            _, _, _, _, cb, rb, cs, rs = detect_pixel_grid_v3(
+                tile, threshold_percentile, max_gap_ratio, regular_tolerance,
+                min_luma_diff, min_distance=min_distance, cluster_radius=cluster_radius,
+            )
+            tiles_data.append((r0, c0, cb, rb, cs, rs))
 
         # Pad all tiles in this row-strip to the same output height
         max_h = max(t.shape[0] for t in out_cols)
@@ -353,7 +368,52 @@ def _downsample_tiled(
             r = np.concatenate([r, pad], axis=1)
         padded_rows.append(r)
 
-    return np.concatenate(padded_rows, axis=0)
+    return np.concatenate(padded_rows, axis=0), tiles_data
+
+
+# ---------------------------------------------------------------------------
+# Tiled edges overlay
+# ---------------------------------------------------------------------------
+
+def make_tiled_grid_overlay(
+    original: Image.Image,
+    tiles_data: list[_TileData],
+    tile_w: int,
+    tile_h: int,
+) -> Image.Image:
+    """
+    Build an edges overlay for tiled processing.
+
+    Per-tile break positions (local coords) are translated to global coords
+    and drawn as solid/dotted red/blue lines via make_grid_overlay.
+    Tile boundaries are then drawn as green lines at alpha 0.5.
+    """
+    all_cb, all_rb, all_cs, all_rs = [], [], [], []
+    for r0, c0, cb, rb, cs, rs in tiles_data:
+        all_cb.extend(cb + c0)
+        all_rb.extend(rb + r0)
+        all_cs.extend(cs + c0)
+        all_rs.extend(rs + r0)
+
+    overlay = make_grid_overlay(
+        original,
+        np.array(all_cb, dtype=float),
+        np.array(all_rb, dtype=float),
+        np.array(all_cs, dtype=float),
+        np.array(all_rs, dtype=float),
+    )
+
+    arr = np.array(overlay, dtype=np.float32)
+    H, W = arr.shape[:2]
+    green = np.array([50, 200, 50], dtype=np.float32)
+    alpha = 0.5
+
+    for c in range(tile_w, W, tile_w):
+        arr[:, c] = arr[:, c] * (1 - alpha) + green * alpha
+    for r in range(tile_h, H, tile_h):
+        arr[r, :] = arr[r, :] * (1 - alpha) + green * alpha
+
+    return Image.fromarray(arr.clip(0, 255).astype(np.uint8))
 
 
 # ---------------------------------------------------------------------------
@@ -387,13 +447,16 @@ def _save_verbose(
     row_synth: np.ndarray,
     stem: str,
     output_dir: Path,
+    edges_overlay: Image.Image | None = None,
 ) -> None:
     """Save the edges overlay, compare, and compare_true verbose images."""
     H_orig, W_orig = np.array(img_original).shape[:2]
 
-    # Edges overlay
+    # Edges overlay (use pre-built one if provided, e.g. for tiled mode)
     edges_path = output_dir / (stem + "_edges3.png")
-    make_grid_overlay(img_original, col_breaks, row_breaks, col_synth, row_synth).save(str(edges_path))
+    if edges_overlay is None:
+        edges_overlay = make_grid_overlay(img_original, col_breaks, row_breaks, col_synth, row_synth)
+    edges_overlay.save(str(edges_path))
     print(f"  Saved: {edges_path}")
 
     # Compare: output scaled back to original size
@@ -461,15 +524,16 @@ def main() -> None:
         if tile_size:
             tw, th = _parse_tile_size(tile_size)
             print(f"  Tiled mode: {tw}x{th} tiles")
-            out_arr = _downsample_tiled(
+            out_arr, tiles_data = _downsample_tiled(
                 arr, tw, th, threshold_percentile, max_gap_ratio,
                 regular_tolerance, force_regular, force_irregular, scale, square,
                 min_luma_diff, method, min_distance, cluster_radius,
             )
-            # For verbose edges overlay, run detection on full image
+            # Global detection only for size reporting
             pixel_w, pixel_h, is_regular_w, is_regular_h, col_breaks, row_breaks, col_synth, row_synth = \
                 detect_pixel_grid_v3(arr, threshold_percentile, max_gap_ratio, regular_tolerance, min_luma_diff,
                                      min_distance=min_distance, cluster_radius=cluster_radius)
+            tiled_overlay = make_tiled_grid_overlay(img, tiles_data, tw, th)
         else:
             pixel_w, pixel_h, is_regular_w, is_regular_h, col_breaks, row_breaks, col_synth, row_synth = \
                 detect_pixel_grid_v3(arr, threshold_percentile, max_gap_ratio, regular_tolerance, min_luma_diff,
@@ -497,8 +561,9 @@ def main() -> None:
         # Verbose outputs
         if verbose:
             vstem = _build_output_stem(input_path.stem, args)
+            overlay = tiled_overlay if tile_size else None
             _save_verbose(img, out_arr, col_breaks, row_breaks, col_synth, row_synth,
-                          vstem, input_path.parent)
+                          vstem, input_path.parent, edges_overlay=overlay)
 
 
 if __name__ == "__main__":
