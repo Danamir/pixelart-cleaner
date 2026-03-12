@@ -19,7 +19,7 @@ In addition to the downsampled pixel-art output, two comparison images are saved
                        pixel-art pixels).
 
 Usage:
-    resize.py <input>... [--output=PATH] [-p P] [--sample=METHOD]
+    resize.py <input>... [--output=PATH] [-p P] [--sample=METHOD] [-g R]
               [-r | -i] [-s S] [-t SIZE] [-q] [-v]
     resize.py -h | --help
 
@@ -30,6 +30,8 @@ Options:
     -o PATH --output=PATH       Output image path (default: <input>_pixel.<ext>).
     -p P --edge-percentile=P    Gradient percentile threshold for break detection [default: 85].
     --sample=METHOD             Sampling method for irregular grids: center, mean, median [default: center].
+    -g R --max-gap=R            Max gap ratio before subdividing: gaps wider than R * period are split.
+                                Increase to allow wider virtual pixels to survive un-subdivided [default: 1.6].
     -r --force-regular          Force regular-grid strategy regardless of detection quality.
     -i --force-irregular        Force irregular span-based strategy regardless of detection quality.
     -s S --scale=S              Divide detected virtual pixel size by S before resampling [default: 1.0].
@@ -90,6 +92,19 @@ def _breaks_to_spans(breaks: np.ndarray, image_length: int) -> list[tuple[int, i
         for i in range(len(bounds) - 1)
         if bounds[i + 1] > bounds[i]
     ]
+
+
+def _spans_to_breaks(spans: list[tuple[int, int]]) -> np.ndarray:
+    """Convert (start, end) spans back to break-line indices (end of each span minus 1)."""
+    return np.array([s - 1 for s, e in spans[1:]], dtype=float)
+
+
+def _centers_to_breaks(centers: list[int]) -> np.ndarray:
+    """Derive break-line positions as midpoints between consecutive grid centers."""
+    return np.array(
+        [(centers[i] + centers[i + 1]) / 2.0 for i in range(len(centers) - 1)],
+        dtype=float,
+    )
 
 
 def _spacing_cv(breaks: np.ndarray) -> float:
@@ -447,6 +462,7 @@ def _flags_suffix(
     tile_size: tuple[int, int] | None,
     square: bool = False,
     edge_percentile: float = 85.0,
+    max_gap_ratio: float = 1.6,
 ) -> str:
     """
     Build a filename suffix encoding the active non-default options, e.g.
@@ -466,6 +482,8 @@ def _flags_suffix(
         parts.append(f"t{tile_size[0]}x{tile_size[1]}")
     if edge_percentile != 85.0:
         parts.append(f"p{edge_percentile:g}")
+    if max_gap_ratio != 1.6:
+        parts.append(f"g{max_gap_ratio:g}")
     return ("_" + "_".join(parts)) if parts else ""
 
 
@@ -513,6 +531,7 @@ def process_file(
     tile_size: tuple[int, int] | None = None,
     flags_suffix: str = "",
     square: bool = False,
+    max_gap_ratio: float = 1.6,
 ) -> None:
     print(f"Loading: {input_path}")
     img, arr = load_image(str(input_path))
@@ -522,7 +541,7 @@ def process_file(
     print("Detecting virtual pixel grid ...")
     mag_h, mag_v = compute_gradients(arr)
     pixel_w, pixel_h, col_breaks, row_breaks = detect_pixel_grid(
-        mag_h, mag_v, edge_percentile
+        mag_h, mag_v, edge_percentile, max_gap_ratio
     )
 
     if pixel_w is None or pixel_h is None:
@@ -572,6 +591,25 @@ def process_file(
             arr, pixel_w, pixel_h, col_breaks, row_breaks,
             tw, th, edge_percentile, sample_method, use_regular, scale, square,
         )
+        # Effective breaks for edge overlay: derive from global grid (tiling only adjusts phase)
+        if use_regular:
+            eff_row_breaks = _centers_to_breaks(_regular_centers(pixel_h, H, row_breaks))
+            eff_col_breaks = _centers_to_breaks(_regular_centers(pixel_w, W, col_breaks))
+        else:
+            eff_row_spans = _breaks_to_spans(row_breaks, H)
+            eff_col_spans = _breaks_to_spans(col_breaks, W)
+            if (scale != 1.0 or square) and pixel_h is not None:
+                if scale >= 1.0:
+                    eff_row_spans = _subdivide_spans(eff_row_spans, pixel_h)
+                else:
+                    eff_row_spans = _merge_spans(eff_row_spans, max(1, round(1.0 / scale)))
+            if (scale != 1.0 or square) and pixel_w is not None:
+                if scale >= 1.0:
+                    eff_col_spans = _subdivide_spans(eff_col_spans, pixel_w)
+                else:
+                    eff_col_spans = _merge_spans(eff_col_spans, max(1, round(1.0 / scale)))
+            eff_row_breaks = _spans_to_breaks(eff_row_spans)
+            eff_col_breaks = _spans_to_breaks(eff_col_spans)
     elif use_regular:
         strategy = "regular (nearest-neighbour at grid centers)"
         row_centers = _regular_centers(pixel_h, H, row_breaks)
@@ -581,6 +619,8 @@ def process_file(
         if abs(len(col_centers) - art_w) > 1:
             print(f"  Warning: regular grid yielded {len(col_centers)} cols, expected {art_w}")
         out_img = _downsample_regular(arr, row_centers, col_centers)
+        eff_row_breaks = _centers_to_breaks(row_centers)
+        eff_col_breaks = _centers_to_breaks(col_centers)
     else:
         strategy = f"irregular (span {sample_method} sampling)"
         row_spans = _breaks_to_spans(row_breaks, H)
@@ -600,6 +640,8 @@ def process_file(
         if len(col_spans) != art_w:
             print(f"  Warning: {len(col_spans)} col spans detected, expected {art_w}")
         out_img = _downsample_irregular(arr, row_spans, col_spans, sample_method)
+        eff_row_breaks = _spans_to_breaks(row_spans)
+        eff_col_breaks = _spans_to_breaks(col_spans)
 
     W_out, H_out = out_img.size
     compare_true_scale = max(1, round(min(W / W_out, H / H_out)))
@@ -609,7 +651,7 @@ def process_file(
     out_img.save(str(output_path))
 
     if verbose:
-        edges_img        = make_grid_overlay(img, col_breaks, row_breaks)
+        edges_img        = make_grid_overlay(img, eff_col_breaks, eff_row_breaks)
         compare_img      = make_compare(out_img, W, H)
         compare_true_img = make_compare_true(out_img, W, H)
 
@@ -642,6 +684,7 @@ def main() -> None:
     square          = args["--square"]
     verbose         = args["--verbose"]
     scale           = float(args["--scale"])
+    max_gap_ratio   = float(args["--max-gap"])
     tile_size       = None
     if args["--tile"]:
         try:
@@ -668,7 +711,7 @@ def main() -> None:
             print(f"Error: file not found: {p}", file=sys.stderr)
         sys.exit(1)
 
-    suffix = _flags_suffix(force_regular, force_irregular, scale, tile_size, square, edge_percentile) if verbose else ""
+    suffix = _flags_suffix(force_regular, force_irregular, scale, tile_size, square, edge_percentile, max_gap_ratio) if verbose else ""
 
     for input_path in input_paths:
         output_path = Path(output_arg) if output_arg else (
@@ -682,6 +725,7 @@ def main() -> None:
             tile_size,
             suffix,
             square,
+            max_gap_ratio,
         )
 
 

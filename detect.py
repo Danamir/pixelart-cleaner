@@ -28,7 +28,7 @@ For each axis the detection runs in two steps:
      meaningful output (whole pixel-art pixel count).
 
 Usage:
-    detect.py <input> [--output=PATH] [--edge-percentile=P] [--palette-colors=N] [--edge-only]
+    detect.py <input> [--output=PATH] [--edge-percentile=P] [--palette-colors=N] [-g R] [--edge-only]
     detect.py -h | --help
 
 Arguments:
@@ -38,6 +38,8 @@ Options:
     -o PATH --output=PATH       Output image path (default: <input>_edges.<ext>).
     --edge-percentile=P         Gradient percentile threshold for break detection, 0-100 [default: 85].
     --palette-colors=N          Max colours for palette quantisation [default: 256].
+    -g R --max-gap=R            Max gap ratio before subdividing: gaps wider than R * period are split.
+                                Increase to allow wider virtual pixels to survive un-subdivided [default: 1.6].
     --edge-only                 Output a greyscale grid-line image instead of a colour overlay.
     -h --help                   Show this screen.
 """
@@ -303,6 +305,7 @@ def detect_pixel_grid(
     mag_h: np.ndarray,
     mag_v: np.ndarray,
     threshold_percentile: float,
+    max_gap_ratio: float = 1.6,
 ) -> tuple[float | None, float | None, np.ndarray, np.ndarray]:
     """
     Detect the virtual pixel grid via horizontal and vertical break-line detection.
@@ -323,7 +326,7 @@ def detect_pixel_grid(
     pixel_h     = estimate_pixel_period(row_breaks, H)
     if pixel_h is not None:
         row_breaks = _remove_close_breaks(row_breaks, pixel_h)
-        row_breaks = _fill_missing_breaks(row_breaks, pixel_h, H)
+        row_breaks = _fill_missing_breaks(row_breaks, pixel_h, H, max_gap_ratio)
 
     # Column breaks — peaks in fraction-of-active-rows voting for a horizontal edge at each col
     col_profile = compute_break_profile(mag_h, threshold_percentile, along_axis=0)
@@ -331,7 +334,7 @@ def detect_pixel_grid(
     pixel_w     = estimate_pixel_period(col_breaks, W)
     if pixel_w is not None:
         col_breaks = _remove_close_breaks(col_breaks, pixel_w)
-        col_breaks = _fill_missing_breaks(col_breaks, pixel_w, W)
+        col_breaks = _fill_missing_breaks(col_breaks, pixel_w, W, max_gap_ratio)
 
     return pixel_w, pixel_h, col_breaks, row_breaks
 
@@ -485,6 +488,7 @@ def main() -> None:
     )
     edge_percentile = float(args["--edge-percentile"])
     palette_colors  = int(args["--palette-colors"])
+    max_gap_ratio   = float(args["--max-gap"])
     edge_only       = args["--edge-only"]
 
     print(f"Loading: {input_path}")
@@ -497,7 +501,7 @@ def main() -> None:
 
     print("Detecting break lines ...")
     pixel_w, pixel_h, col_breaks, row_breaks = detect_pixel_grid(
-        mag_h, mag_v, edge_percentile
+        mag_h, mag_v, edge_percentile, max_gap_ratio
     )
 
     print("Counting colour palette ...")
