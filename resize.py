@@ -1,311 +1,289 @@
 #!/usr/bin/env python3
-"""Downsample an AI-generated pixel-art image to its true pixel-art resolution.
+"""Downsample AI-generated pixel art to true pixel-art resolution.
 
-Detects the virtual pixel grid (via break-line analysis) then reconstructs the
-image by sampling each virtual pixel block.  Two strategies are auto-selected:
-
-  regular grid   -- period estimated successfully: nearest-neighbour sampling
-                    on a phase-corrected regular grid centred over each virtual
-                    pixel.
-  irregular grid -- period estimation failed: each virtual pixel is individually
-                    bounded by the detected break lines and sampled at its
-                    centre (or mean/median).
-
-In addition to the downsampled pixel-art output, two comparison images are saved:
-  _compare.png      -- pixel art scaled back to the original image dimensions
-                       via nearest-neighbour (exact same pixel count as input).
-  _compare_true.png -- pixel art scaled up by the largest integer factor that
-                       keeps it close to the original size (preserves square
-                       pixel-art pixels).
+Uses the luma line-pair detection algorithm to find virtual pixel
+boundaries, then samples each virtual pixel block using the chosen method.
 
 Usage:
-    resize.py <input>... [--output=PATH] [-p P] [--sample=METHOD] [-g R]
-              [-r | -i] [-s S] [-t SIZE] [-q] [-v]
+    resize.py <input>... [options]
     resize.py -h | --help
 
 Arguments:
-    <input>                 Input image path(s).
+    <input>...              Input image path(s).
 
 Options:
-    -o PATH --output=PATH       Output image path (default: <input>_pixel.<ext>).
-    -p P --edge-percentile=P    Gradient percentile threshold for break detection [default: 85].
-    --sample=METHOD             Sampling method for irregular grids: center, mean, median [default: center].
-    -g R --max-gap=R            Max gap ratio before subdividing: gaps wider than R * period are split.
-                                Increase to allow wider virtual pixels to survive un-subdivided [default: 1.6].
-    -r --force-regular          Force regular-grid strategy regardless of detection quality.
-    -i --force-irregular        Force irregular span-based strategy regardless of detection quality.
-    -s S --scale=S              Divide detected virtual pixel size by S before resampling [default: 1.0].
-    -t SIZE --tile=SIZE         Split image into tiles of SIZE (e.g. 64x64) and detect each independently.
-                                The global period is kept; only the phase is corrected per tile.
-    -q --square                 Force square virtual pixels by averaging detected width and height.
-    -v --verbose                Also save _edges.png, _compare.png, and _compare_true.png.
+    -o PATH --output=PATH       Output path (default: <stem>_pixel.png).
+    -p P --edge-percentile=P    Per-pixel luma-diff percentile threshold [default: 85].
+    -e E --min-edge=E           Minimum absolute luma diff to count as an edge [default: 10].
+    -d D --min-distance=D       Minimum distance in px between two peaks in the break profile [default: 3].
+    -c C --cluster-radius=C     Max distance in px to merge nearby band votes into one break [default: 1].
+    -g R --max-gap=R            Max gap ratio before subdividing [default: 1.6].
+    --regular-tolerance=T       Span-size tolerance for regularity check (0-1) [default: 0.10].
+    -r --force-regular          Always use regular grid strategy.
+    -i --force-irregular        Always use irregular span strategy.
+    -s S --scale=S              Divide detected pixel size by S (S>1 finer, S<1 coarser) [default: 1.0].
+    -t SIZE --tile=SIZE         Process in independent tiles, e.g. 64x64.
+    -m METHOD --sample=METHOD   Color sampling method: center, center_region, max [default: center].
+    -q --square                 Force square output pixels.
+    -v --verbose                Also save _edges, _compare, _compare_true images.
     -h --help                   Show this screen.
 """
 
 import sys
+from math import ceil
 from pathlib import Path
 
 import numpy as np
 from docopt import docopt
 from PIL import Image
 
-from detect import load_image, compute_gradients, detect_pixel_grid, make_grid_overlay
+from detect import (
+    load_image,
+    detect_pixel_grid_v3,
+    make_grid_overlay,
+)
 
 
 # ---------------------------------------------------------------------------
-# Span construction
+# Block sampling
 # ---------------------------------------------------------------------------
 
-def _spans_in_tile(
-    global_spans: list[tuple[int, int]],
-    t0: int,
-    t1: int,
+def _sample_center(block: np.ndarray) -> np.ndarray:
+    """Return the single center pixel of an RGB block (H, W, 3)."""
+    h, w = block.shape[:2]
+    return block[h // 2, w // 2].astype(np.float32)
+
+
+def _sample_max(block: np.ndarray, n_buckets: int = 10) -> np.ndarray:
+    """
+    Return the mean color of the dominant color cluster in the block.
+
+    Quantizes each RGB channel into n_buckets levels, finds the bucket
+    (channel triplet) with the most pixels, then returns the mean of the
+    actual (unquantized) pixels belonging to that bucket.  This is robust
+    to the slight per-pixel color variation typical in AI-generated pixel art.
+    """
+    pixels = block.reshape(-1, 3)
+    step = max(1, round(256 / n_buckets))
+    quantized = (pixels // step).astype(np.int32)
+    keys, counts = np.unique(quantized, axis=0, return_counts=True)
+    best = keys[counts.argmax()]
+    mask = np.all(quantized == best, axis=1)
+    return pixels[mask].mean(axis=0)
+
+
+def _sample_center_region(block: np.ndarray) -> np.ndarray:
+    """
+    Return the mean color of the inner 50% of an RGB block (H, W, 3).
+
+    Trims 25% from each edge to avoid anti-aliased or blended boundary pixels.
+    Falls back to the full block for blocks too small to trim meaningfully.
+    """
+    h, w = block.shape[:2]
+    r0, r1 = h // 4, h - h // 4
+    c0, c1 = w // 4, w - w // 4
+    if r0 >= r1:
+        r0, r1 = 0, h
+    if c0 >= c1:
+        c0, c1 = 0, w
+    return block[r0:r1, c0:c1].mean(axis=(0, 1))
+
+
+def sample_block(block: np.ndarray, method: str = "center") -> np.ndarray:
+    """Dispatch to the chosen sampling method."""
+    if method == "center_region":
+        return _sample_center_region(block)
+    if method == "max":
+        return _sample_max(block)
+    return _sample_center(block)
+
+
+# ---------------------------------------------------------------------------
+# Span helpers
+# ---------------------------------------------------------------------------
+
+def spans_from_breaks(breaks: np.ndarray, image_length: int) -> list[tuple[int, int]]:
+    """Convert break positions (gradient space) to (start, end) pixel spans."""
+    bounds = [0] + [int(b) + 1 for b in sorted(breaks)] + [image_length]
+    return [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)
+            if bounds[i + 1] > bounds[i]]
+
+
+def _best_phase(boundaries: np.ndarray, period: float) -> float:
+    """
+    Find the phase of a regular grid (position of first boundary) that best
+    aligns to the observed span boundaries using a circular mean.
+    """
+    if len(boundaries) == 0:
+        return 0.0
+    mapped = boundaries % period
+    angles = mapped / period * 2 * np.pi
+    cx = float(np.cos(angles).mean())
+    cy = float(np.sin(angles).mean())
+    angle = np.arctan2(cy, cx)
+    if angle < 0:
+        angle += 2 * np.pi
+    return float(angle / (2 * np.pi) * period)
+
+
+def regular_grid_spans(
+    image_length: int,
+    period: float,
+    breaks: np.ndarray,
 ) -> list[tuple[int, int]]:
     """
-    Return the subset of global spans whose CENTER falls in [t0, t1), clipped
-    to [t0, t1) and shifted to tile-local coordinates.
-
-    Attributing spans by center guarantees each span belongs to exactly one
-    tile even when it straddles a tile boundary, so span counts sum correctly
-    across tiles.
+    Generate regular-grid (start, end) spans covering [0, image_length),
+    aligned to the detected break positions via circular-mean phase fitting.
     """
-    result = []
-    for s, e in global_spans:
-        if t0 <= (s + e) / 2 < t1:
-            local_s = max(s, t0) - t0
-            local_e = min(e, t1) - t0
-            if local_e > local_s:
-                result.append((local_s, local_e))
-    return result
+    if len(breaks) > 0:
+        boundaries = breaks.astype(float) + 1   # pixel-space boundaries
+        phase = _best_phase(boundaries, period)
+    else:
+        phase = 0.0
+
+    # Find the first span index k such that phase + k*period <= 0
+    if phase > 0:
+        k_first = -int(ceil(phase / period))
+    else:
+        k_first = 0
+
+    spans = []
+    k = k_first
+    while True:
+        pos_s = phase + k * period
+        pos_e = phase + (k + 1) * period
+        if pos_s >= image_length:
+            break
+        s = max(0, round(pos_s))
+        e = min(image_length, round(pos_e))
+        if e > s:
+            spans.append((s, e))
+        k += 1
+
+    return spans
 
 
-def _breaks_to_spans(breaks: np.ndarray, image_length: int) -> list[tuple[int, int]]:
+# ---------------------------------------------------------------------------
+# Core downsampling
+# ---------------------------------------------------------------------------
+
+def downsample(
+    arr: np.ndarray,
+    col_spans: list[tuple[int, int]],
+    row_spans: list[tuple[int, int]],
+    method: str = "center",
+) -> np.ndarray:
     """
-    Convert detected break line indices to (start, end) pixel spans.
+    Sample each virtual pixel block (row_span x col_span).
 
-    A break at index b means a boundary between pixel b and b+1, so the
-    boundary sits at b+1.  Spans cover the full [0, image_length) range.
+    Returns float32 array of shape (len(row_spans), len(col_spans), 3).
     """
-    bounds = [0] + [int(b) + 1 for b in sorted(breaks)] + [image_length]
-    return [
-        (bounds[i], bounds[i + 1])
-        for i in range(len(bounds) - 1)
-        if bounds[i + 1] > bounds[i]
-    ]
+    out = np.zeros((len(row_spans), len(col_spans), 3), dtype=np.float32)
+    for ri, (r0, r1) in enumerate(row_spans):
+        for ci, (c0, c1) in enumerate(col_spans):
+            out[ri, ci] = sample_block(arr[r0:r1, c0:c1], method)
+    return out
 
 
-def _spans_to_breaks(spans: list[tuple[int, int]]) -> np.ndarray:
-    """Convert (start, end) spans back to break-line indices (end of each span minus 1)."""
-    return np.array([s - 1 for s, e in spans[1:]], dtype=float)
+# ---------------------------------------------------------------------------
+# Square-pixel irregular mode (repeats output pixels for wide/tall spans)
+# ---------------------------------------------------------------------------
+
+def downsample_square_irregular(
+    arr: np.ndarray,
+    col_spans: list[tuple[int, int]],
+    row_spans: list[tuple[int, int]],
+    target_size: float,
+    method: str = "center",
+) -> np.ndarray:
+    """
+    Irregular downsampling with square-pixel output.
+
+    Each span is sampled once; its color is repeated round(span/target_size)
+    times so that every output pixel represents an approximately square region.
+    """
+    col_colors = []
+    for c0, c1 in col_spans:
+        reps = max(1, round((c1 - c0) / target_size))
+        col_colors.append((c0, c1, reps))
+
+    row_colors = []
+    for r0, r1 in row_spans:
+        reps = max(1, round((r1 - r0) / target_size))
+        row_colors.append((r0, r1, reps))
+
+    total_rows = sum(r for _, _, r in row_colors)
+    total_cols = sum(r for _, _, r in col_colors)
+    out = np.zeros((total_rows, total_cols, 3), dtype=np.float32)
+
+    row_out = 0
+    for r0, r1, rreps in row_colors:
+        col_out = 0
+        for c0, c1, creps in col_colors:
+            color = sample_block(arr[r0:r1, c0:c1], method)
+            for dr in range(rreps):
+                for dc in range(creps):
+                    out[row_out + dr, col_out + dc] = color
+            col_out += creps
+        row_out += rreps
+
+    return out
 
 
-def _centers_to_breaks(centers: list[int]) -> np.ndarray:
-    """Derive break-line positions as midpoints between consecutive grid centers."""
-    return np.array(
-        [(centers[i] + centers[i + 1]) / 2.0 for i in range(len(centers) - 1)],
-        dtype=float,
+# ---------------------------------------------------------------------------
+# Single-image downsampling
+# ---------------------------------------------------------------------------
+
+def _downsample_single(
+    arr: np.ndarray,
+    threshold_percentile: float,
+    max_gap_ratio: float,
+    regular_tolerance: float,
+    force_regular: bool,
+    force_irregular: bool,
+    scale: float,
+    square: bool,
+    min_luma_diff: float = 10.0,
+    method: str = "center",
+    min_distance: int = 3,
+    cluster_radius: int = 1,
+) -> np.ndarray:
+    """Detect grid and downsample one image (or tile)."""
+    pixel_w, pixel_h, is_regular_w, is_regular_h, col_breaks, row_breaks, _, _ = \
+        detect_pixel_grid_v3(arr, threshold_percentile, max_gap_ratio, regular_tolerance, min_luma_diff,
+                             min_distance=min_distance, cluster_radius=cluster_radius)
+
+    # Apply scale
+    if pixel_w is not None:
+        pixel_w /= scale
+    if pixel_h is not None:
+        pixel_h /= scale
+
+    # Decide strategy
+    both_regular = is_regular_w and is_regular_h
+    use_regular = (
+        not force_irregular
+        and (force_regular or both_regular)
+        and pixel_w is not None
+        and pixel_h is not None
     )
 
+    H, W = arr.shape[:2]
 
-def _spacing_cv(breaks: np.ndarray) -> float:
-    """
-    Coefficient of variation of spacings between consecutive detected breaks.
-
-    Measures true grid regularity: 0 = perfectly even, high = irregular spacing.
-    Ignores total break count (so sparse-but-regular detection stays near 0).
-    """
-    if len(breaks) < 2:
-        return 0.0
-    spacings = np.diff(breaks.astype(float))
-    return float(spacings.std() / spacings.mean()) if spacings.mean() > 0 else 0.0
-
-
-# ---------------------------------------------------------------------------
-# Regular-grid centers (consistent case)
-# ---------------------------------------------------------------------------
-
-def _regular_centers(
-    pixel_period: float,
-    image_length: int,
-    breaks: np.ndarray,
-) -> list[int]:
-    """
-    Compute center sample coordinates for a phase-corrected regular virtual-pixel grid.
-
-    Uses detected break positions to find the best-fitting phase offset (via
-    Gaussian alignment), then places one center per virtual pixel across the
-    image at half-period offsets from each grid boundary.
-
-    Returns a list of integer pixel coordinates, one per virtual pixel.
-    """
-    art_size = max(1, round(image_length / pixel_period))
-
-    # --- Phase estimation ---
-    if len(breaks) >= 1:
-        best_phase, best_score = 0.0, -1.0
-        for anchor in breaks:
-            phase = float(anchor) % pixel_period
-            rem   = (breaks.astype(float) - phase) % pixel_period
-            aligned = np.minimum(rem, pixel_period - rem)
-            score = float(np.exp(-0.5 * (aligned / 1.0) ** 2).mean())
-            if score > best_score:
-                best_score, best_phase = score, phase
+    if use_regular:
+        if square:
+            sq = (pixel_w + pixel_h) / 2.0
+            pixel_w = pixel_h = sq
+        col_spans = regular_grid_spans(W, pixel_w, col_breaks)
+        row_spans = regular_grid_spans(H, pixel_h, row_breaks)
+        return downsample(arr, col_spans, row_spans, method)
     else:
-        best_phase = 0.0
-
-    # --- Build grid boundaries within [0, image_length] ---
-    # Grid lines at: ..., best_phase - p, best_phase, best_phase + p, ...
-    # A phase offset > 0 produces a leading partial span [0, best_phase) AND a
-    # trailing partial span at the other end, giving art_size + 1 intervals total.
-    # We clip back to exactly art_size by dropping the smaller of the two edge spans.
-    first = best_phase if best_phase > 0 else pixel_period
-    bounds = [0.0]
-    b = first
-    while b < image_length:
-        bounds.append(b)
-        b += pixel_period
-    bounds.append(float(image_length))
-
-    # Drop the smaller edge span until we reach art_size intervals
-    while len(bounds) - 1 > art_size:
-        lead  = bounds[1]  - bounds[0]
-        trail = bounds[-1] - bounds[-2]
-        if lead <= trail:
-            bounds.pop(0)
-        else:
-            bounds.pop(-1)
-
-    # --- One center per virtual pixel span ---
-    return [
-        max(0, min(image_length - 1, round((bounds[i] + bounds[i + 1]) / 2.0)))
-        for i in range(len(bounds) - 1)
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Span subdivision (for --scale with irregular mode)
-# ---------------------------------------------------------------------------
-
-def _subdivide_spans(
-    spans: list[tuple[int, int]],
-    target_size: float,
-) -> list[tuple[int, int]]:
-    """
-    Split each span into round(size / target_size) equal sub-spans.
-    Used when scale > 1.0 (target_size < natural span size).
-    """
-    result = []
-    for s, e in spans:
-        n = max(1, round((e - s) / target_size))
-        step = (e - s) / n
-        for i in range(n):
-            sub_s = round(s + i * step)
-            sub_e = round(s + (i + 1) * step)
-            if sub_e > sub_s:
-                result.append((sub_s, sub_e))
-    return result
-
-
-def _merge_spans(
-    spans: list[tuple[int, int]],
-    group_size: int,
-) -> list[tuple[int, int]]:
-    """
-    Merge consecutive spans in batches of group_size into a single span.
-    Used when scale < 1.0 (group_size = round(1 / scale) virtual pixels
-    should map to one output pixel).
-    """
-    result = []
-    for i in range(0, len(spans), group_size):
-        batch = spans[i : i + group_size]
-        result.append((batch[0][0], batch[-1][1]))
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Sampling
-# ---------------------------------------------------------------------------
-
-def _sample_block(
-    arr: np.ndarray,
-    r0: int, r1: int,
-    c0: int, c1: int,
-    method: str,
-) -> np.ndarray:
-    """Return the sampled colour (uint8, shape (3,)) for one virtual pixel block."""
-    if method == "center":
-        r = (r0 + r1) // 2
-        c = (c0 + c1) // 2
-        return arr[r, c].clip(0, 255).astype(np.uint8)
-    block = arr[r0:r1, c0:c1].reshape(-1, 3)
-    if method == "mean":
-        return block.mean(axis=0).clip(0, 255).astype(np.uint8)
-    # median
-    return np.median(block, axis=0).clip(0, 255).astype(np.uint8)
-
-
-def _downsample_irregular(
-    arr: np.ndarray,
-    row_spans: list[tuple[int, int]],
-    col_spans: list[tuple[int, int]],
-    method: str,
-) -> Image.Image:
-    """Reconstruct by sampling each detected virtual pixel block individually."""
-    H_out, W_out = len(row_spans), len(col_spans)
-    out = np.zeros((H_out, W_out, 3), dtype=np.uint8)
-    for ri, (r0, r1) in enumerate(row_spans):
-        for ci, (c0, c1) in enumerate(col_spans):
-            out[ri, ci] = _sample_block(arr, r0, r1, c0, c1, method)
-    return Image.fromarray(out)
-
-
-def _downsample_square_padded(
-    arr: np.ndarray,
-    row_spans: list[tuple[int, int]],
-    col_spans: list[tuple[int, int]],
-    target_size: float,
-    method: str,
-) -> Image.Image:
-    """
-    Reconstruct with square-looking output pixels by padding rectangular spans.
-
-    Each virtual pixel is sampled once.  Its colour is then repeated
-    round(span_size / target_size) times along each axis so that every output
-    pixel represents approximately a target_size x target_size source region.
-
-    Wide spans (e.g. preserved by --max-gap) produce several identical columns;
-    tall spans produce several identical rows.  No independent sub-sampling is
-    done, so no extra edge artefacts appear within a single virtual pixel.
-    """
-    row_reps = [max(1, round((e - s) / target_size)) for s, e in row_spans]
-    col_reps = [max(1, round((e - s) / target_size)) for s, e in col_spans]
-    H_out = sum(row_reps)
-    W_out = sum(col_reps)
-    out = np.zeros((H_out, W_out, 3), dtype=np.uint8)
-    ri_out = 0
-    for ri, (r0, r1) in enumerate(row_spans):
-        nr = row_reps[ri]
-        ci_out = 0
-        for ci, (c0, c1) in enumerate(col_spans):
-            color = _sample_block(arr, r0, r1, c0, c1, method)
-            out[ri_out:ri_out + nr, ci_out:ci_out + col_reps[ci]] = color
-            ci_out += col_reps[ci]
-        ri_out += nr
-    return Image.fromarray(out)
-
-
-def _downsample_regular(
-    arr: np.ndarray,
-    row_centers: list[int],
-    col_centers: list[int],
-) -> Image.Image:
-    """Reconstruct by nearest-neighbour sampling at computed grid centers."""
-    H_out, W_out = len(row_centers), len(col_centers)
-    out = np.zeros((H_out, W_out, 3), dtype=np.uint8)
-    for ri, r in enumerate(row_centers):
-        for ci, c in enumerate(col_centers):
-            out[ri, ci] = arr[r, c].clip(0, 255).astype(np.uint8)
-    return Image.fromarray(out)
+        col_spans = spans_from_breaks(col_breaks, W)
+        row_spans = spans_from_breaks(row_breaks, H)
+        if square and pixel_w is not None and pixel_h is not None:
+            target = min(pixel_w, pixel_h) / scale
+            return downsample_square_irregular(arr, col_spans, row_spans, target, method)
+        return downsample(arr, col_spans, row_spans, method)
 
 
 # ---------------------------------------------------------------------------
@@ -313,511 +291,279 @@ def _downsample_regular(
 # ---------------------------------------------------------------------------
 
 def _parse_tile_size(s: str) -> tuple[int, int]:
-    """Parse a 'WxH' tile size string into (width, height) integers."""
-    try:
-        w, h = s.lower().split("x")
-        return int(w), int(h)
-    except Exception:
-        raise ValueError(f"Invalid tile size {s!r} — expected format: WxH (e.g. 64x64)")
+    parts = s.lower().split("x")
+    return int(parts[0]), int(parts[1])
 
 
-def _pad_tile(tile: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
-    """
-    Pad a tile array to (target_h, target_w) by repeating edge pixels.
-
-    Also trims to the target if the tile is somehow larger (shouldn't happen
-    in normal use but guards against rounding edge cases).
-    """
-    h, w = tile.shape[:2]
-    if h < target_h:
-        pad = np.repeat(tile[-1:, :], target_h - h, axis=0)
-        tile = np.concatenate([tile, pad], axis=0)
-    if w < target_w:
-        pad = np.repeat(tile[:, -1:], target_w - w, axis=1)
-        tile = np.concatenate([tile, pad], axis=1)
-    return tile[:target_h, :target_w]
+_TileData = tuple[int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+# (row_offset, col_offset, col_breaks, row_breaks, col_synth, row_synth)
 
 
 def _downsample_tiled(
     arr: np.ndarray,
-    pixel_w: float,
-    pixel_h: float,
-    col_breaks: np.ndarray,
-    row_breaks: np.ndarray,
     tile_w: int,
     tile_h: int,
-    edge_percentile: float,
-    sample_method: str,
-    use_regular: bool,
-    scale: float = 1.0,
-    square: bool = False,
-    raw_pixel_w: float | None = None,
-    raw_pixel_h: float | None = None,
-) -> Image.Image:
+    threshold_percentile: float,
+    max_gap_ratio: float,
+    regular_tolerance: float,
+    force_regular: bool,
+    force_irregular: bool,
+    scale: float,
+    square: bool,
+    min_luma_diff: float = 10.0,
+    method: str = "center",
+    min_distance: int = 3,
+    cluster_radius: int = 1,
+) -> tuple[np.ndarray, list[_TileData]]:
     """
-    Downsample by processing the image in tiles.
+    Split the image into tiles, downsample each independently, then assemble.
 
-    Two-pass algorithm:
-      Pass 1 -- sample every tile independently (local phase correction for
-                regular mode; local span detection for irregular mode).
-      Pass 2 -- determine the canonical output size per strip, pad tiles that
-                came out short, and concatenate.
+    Each tile gets its own grid detection, providing local phase correction.
+    Tiles in the same row are padded to the same output height; tiles in the
+    same column are padded to the same output width before concatenation.
 
-    Canonical size per strip:
-      regular   -- count of global output centers falling in that strip's input
-                   range (guarantees exact art_w x art_h total).
-      irregular -- maximum output size across all tiles in the strip (no global
-                   reference exists; padding fills tiles where detection missed
-                   a span).
+    Returns (out_arr, tiles_data) where tiles_data holds per-tile detection
+    results in local coordinates for building a tiled edges overlay.
     """
     H, W = arr.shape[:2]
+    row_bounds = [(r, min(r + tile_h, H)) for r in range(0, H, tile_h)]
+    col_bounds = [(c, min(c + tile_w, W)) for c in range(0, W, tile_w)]
 
-    tile_row_starts = list(range(0, H, tile_h))
-    tile_col_starts = list(range(0, W, tile_w))
+    out_rows = []
+    tiles_data: list[_TileData] = []
 
-    # Pre-compute global spans for irregular mode (used in pass 1)
-    global_row_spans = _breaks_to_spans(row_breaks, H) if not use_regular else None
-    global_col_spans = _breaks_to_spans(col_breaks, W) if not use_regular else None
+    for r0, r1 in row_bounds:
+        out_cols = []
+        for c0, c1 in col_bounds:
+            tile = arr[r0:r1, c0:c1]
+            tile_out = _downsample_single(
+                tile, threshold_percentile, max_gap_ratio, regular_tolerance,
+                force_regular, force_irregular, scale, square, min_luma_diff, method,
+                min_distance, cluster_radius,
+            )
+            out_cols.append(tile_out)
 
-    # --- Pass 1: sample every tile ---
-    tile_grid: list[list[np.ndarray]] = []
-    for r0 in tile_row_starts:
-        r1 = min(r0 + tile_h, H)
-        th = r1 - r0
-        row: list[np.ndarray] = []
-        for c0 in tile_col_starts:
-            c1 = min(c0 + tile_w, W)
-            tw = c1 - c0
-            tile_arr = arr[r0:r1, c0:c1]
+            _, _, _, _, cb, rb, cs, rs = detect_pixel_grid_v3(
+                tile, threshold_percentile, max_gap_ratio, regular_tolerance,
+                min_luma_diff, min_distance=min_distance, cluster_radius=cluster_radius,
+            )
+            tiles_data.append((r0, c0, cb, rb, cs, rs))
 
-            if use_regular:
-                # Regular mode: local detection for phase correction;
-                # fall back to global breaks if the tile is featureless.
-                mag_h_t, mag_v_t = compute_gradients(tile_arr)
-                _, _, t_col_breaks, t_row_breaks = detect_pixel_grid(
-                    mag_h_t, mag_v_t, edge_percentile
-                )
-                if len(t_row_breaks) == 0:
-                    t_row_breaks = row_breaks[(row_breaks >= r0) & (row_breaks < r1)] - r0
-                if len(t_col_breaks) == 0:
-                    t_col_breaks = col_breaks[(col_breaks >= c0) & (col_breaks < c1)] - c0
-                row_centers = _regular_centers(pixel_h, th, t_row_breaks)
-                col_centers = _regular_centers(pixel_w, tw, t_col_breaks)
-                tile_out = np.array(_downsample_regular(tile_arr, row_centers, col_centers))
-            else:
-                # Irregular mode: attribute each global span to the tile containing
-                # its center to avoid double-counting at tile boundaries.
-                t_row_spans = _spans_in_tile(global_row_spans, r0, r1)
-                t_col_spans = _spans_in_tile(global_col_spans, c0, c1)
-                _pw = raw_pixel_w if raw_pixel_w is not None else pixel_w
-                _ph = raw_pixel_h if raw_pixel_h is not None else pixel_h
-                if scale != 1.0:
-                    if scale > 1.0:
-                        t_row_spans = _subdivide_spans(t_row_spans, _ph)
-                        t_col_spans = _subdivide_spans(t_col_spans, _pw)
-                    else:
-                        g = max(1, round(1.0 / scale))
-                        t_row_spans = _merge_spans(t_row_spans, g)
-                        t_col_spans = _merge_spans(t_col_spans, g)
-                tile_out = np.array(
-                    _downsample_irregular(tile_arr, t_row_spans, t_col_spans, sample_method)
-                )
+        # Pad all tiles in this row-strip to the same output height
+        max_h = max(t.shape[0] for t in out_cols)
+        padded = []
+        for t in out_cols:
+            if t.shape[0] < max_h:
+                pad = np.zeros((max_h - t.shape[0], t.shape[1], 3), dtype=np.float32)
+                t = np.concatenate([t, pad], axis=0)
+            padded.append(t)
+        out_rows.append(np.concatenate(padded, axis=1))
 
-            row.append(tile_out)
-        tile_grid.append(row)
+    # Pad all row-strips to the same output width
+    max_w = max(r.shape[1] for r in out_rows)
+    padded_rows = []
+    for r in out_rows:
+        if r.shape[1] < max_w:
+            pad = np.zeros((r.shape[0], max_w - r.shape[1], 3), dtype=np.float32)
+            r = np.concatenate([r, pad], axis=1)
+        padded_rows.append(r)
 
-    n_tile_rows = len(tile_row_starts)
-    n_tile_cols = len(tile_col_starts)
-
-    # --- Pass 2: canonical sizes, pad, assemble ---
-    if use_regular:
-        # Use global grid to guarantee exact art_h x art_w total
-        global_row_centers = _regular_centers(pixel_h, H, row_breaks)
-        global_col_centers = _regular_centers(pixel_w, W, col_breaks)
-        canon_rows = [
-            sum(1 for rc in global_row_centers if r0 <= rc < min(r0 + tile_h, H))
-            for r0 in tile_row_starts
-        ]
-        canon_cols = [
-            sum(1 for cc in global_col_centers if c0 <= cc < min(c0 + tile_w, W))
-            for c0 in tile_col_starts
-        ]
-    else:
-        # No global reference: use the maximum output size within each strip
-        canon_rows = [
-            max(tile_grid[ri][ci].shape[0] for ci in range(n_tile_cols))
-            for ri in range(n_tile_rows)
-        ]
-        canon_cols = [
-            max(tile_grid[ri][ci].shape[1] for ri in range(n_tile_rows))
-            for ci in range(n_tile_cols)
-        ]
-
-    strip_list = []
-    for ri in range(n_tile_rows):
-        if canon_rows[ri] == 0:
-            continue
-        tile_row_out = []
-        for ci in range(n_tile_cols):
-            if canon_cols[ci] == 0:
-                continue
-            tile_out = _pad_tile(tile_grid[ri][ci], canon_rows[ri], canon_cols[ci])
-            tile_row_out.append(tile_out)
-        if tile_row_out:
-            strip_list.append(np.concatenate(tile_row_out, axis=1))
-
-    return Image.fromarray(np.concatenate(strip_list, axis=0))
+    return np.concatenate(padded_rows, axis=0), tiles_data
 
 
 # ---------------------------------------------------------------------------
-# Tile boundary overlay
+# Tiled edges overlay
 # ---------------------------------------------------------------------------
 
-def draw_tile_boundaries(
-    img: Image.Image,
+def make_tiled_grid_overlay(
+    original: Image.Image,
+    tiles_data: list[_TileData],
     tile_w: int,
     tile_h: int,
-    color: tuple[int, int, int] = (50, 220, 50),
-    dot: int = 4,
-    gap: int = 4,
-    alpha: float = 0.9,
 ) -> Image.Image:
     """
-    Draw tile boundaries as green dotted lines over an image.
+    Build an edges overlay for tiled processing.
 
-    Lines are drawn at multiples of tile_w (vertical) and tile_h (horizontal),
-    excluding the image edges.  Each line alternates `dot` filled pixels with
-    `gap` transparent pixels along its length.
+    Per-tile break positions (local coords) are translated to global coords
+    and drawn as solid/dotted red/blue lines via make_grid_overlay.
+    Tile boundaries are then drawn as green lines at alpha 0.5.
     """
-    arr = np.array(img, dtype=np.float32)
+    all_cb, all_rb, all_cs, all_rs = [], [], [], []
+    for r0, c0, cb, rb, cs, rs in tiles_data:
+        all_cb.extend(cb + c0)
+        all_rb.extend(rb + r0)
+        all_cs.extend(cs + c0)
+        all_rs.extend(rs + r0)
+
+    overlay = make_grid_overlay(
+        original,
+        np.array(all_cb, dtype=float),
+        np.array(all_rb, dtype=float),
+        np.array(all_cs, dtype=float),
+        np.array(all_rs, dtype=float),
+    )
+
+    arr = np.array(overlay, dtype=np.float32)
     H, W = arr.shape[:2]
-    c = np.array(color, dtype=np.float32)
+    green = np.array([50, 200, 50], dtype=np.float32)
+    alpha = 0.5
 
-    # Boolean mask of "filled" positions along a line of the given length
-    def _dot_mask(length: int) -> np.ndarray:
-        idx = np.arange(length)
-        return (idx // dot) % 2 == 0
-
-    h_mask = _dot_mask(W)   # which columns are filled on horizontal lines
-    v_mask = _dot_mask(H)   # which rows    are filled on vertical lines
-
-    for row in np.arange(tile_h, H, tile_h):
-        arr[row, h_mask] = arr[row, h_mask] * (1 - alpha) + c * alpha
-
-    for col in np.arange(tile_w, W, tile_w):
-        arr[v_mask, col] = arr[v_mask, col] * (1 - alpha) + c * alpha
+    for c in range(tile_w, W, tile_w):
+        arr[:, c] = arr[:, c] * (1 - alpha) + green * alpha
+    for r in range(tile_h, H, tile_h):
+        arr[r, :] = arr[r, :] * (1 - alpha) + green * alpha
 
     return Image.fromarray(arr.clip(0, 255).astype(np.uint8))
 
 
 # ---------------------------------------------------------------------------
-# Comparison images
+# Verbose output helpers
 # ---------------------------------------------------------------------------
 
-def make_compare(pixel_img: Image.Image, orig_W: int, orig_H: int) -> Image.Image:
-    """Scale pixel art back to the original image dimensions (nearest-neighbour)."""
-    return pixel_img.resize((orig_W, orig_H), Image.Resampling.NEAREST)
+def _build_output_stem(stem: str, args: dict) -> str:
+    """Append active non-default option suffixes to the output stem."""
+    suffix = ""
+    if args["--force-irregular"]:
+        suffix += "_i"
+    if args["--force-regular"]:
+        suffix += "_r"
+    if args["--square"]:
+        suffix += "_q"
+    g = float(args["--max-gap"])
+    if g != 1.6:
+        suffix += f"_g{g:g}"
+    p = float(args["--edge-percentile"])
+    if p != 85:
+        suffix += f"_p{p:g}"
+    return stem + suffix
 
 
-def make_compare_true(pixel_img: Image.Image, orig_W: int, orig_H: int) -> Image.Image:
-    """
-    Scale pixel art by the nearest integer factor relative to the original size.
-
-    The scale is chosen as round(min(orig_W / art_W, orig_H / art_H)), so each
-    pixel-art pixel maps to exactly scale x scale output pixels (square pixels).
-    """
-    art_W, art_H = pixel_img.size
-    scale = max(1, round(min(orig_W / art_W, orig_H / art_H)))
-    return pixel_img.resize((art_W * scale, art_H * scale), Image.Resampling.NEAREST)
-
-
-# ---------------------------------------------------------------------------
-# Verbose filename suffix
-# ---------------------------------------------------------------------------
-
-def _flags_suffix(
-    force_regular: bool,
-    force_irregular: bool,
-    scale: float,
-    tile_size: tuple[int, int] | None,
-    square: bool = False,
-    edge_percentile: float = 85.0,
-    max_gap_ratio: float = 1.6,
-) -> str:
-    """
-    Build a filename suffix encoding the active non-default options, e.g.
-    '_r_s2.0_t16x16'.  Returns an empty string when all options are at
-    their defaults.
-    """
-    parts = []
-    if force_regular:
-        parts.append("r")
-    if force_irregular:
-        parts.append("i")
-    if square:
-        parts.append("q")
-    if scale != 1.0:
-        parts.append(f"s{scale}")
-    if tile_size is not None:
-        parts.append(f"t{tile_size[0]}x{tile_size[1]}")
-    if edge_percentile != 85.0:
-        parts.append(f"p{edge_percentile:g}")
-    if max_gap_ratio != 1.6:
-        parts.append(f"g{max_gap_ratio:g}")
-    return ("_" + "_".join(parts)) if parts else ""
-
-
-# ---------------------------------------------------------------------------
-# Report
-# ---------------------------------------------------------------------------
-
-def _print_report(
-    W: int, H: int,
-    W_out: int, H_out: int,
-    row_cv: float, col_cv: float,
-    strategy: str,
-    compare_true_scale: int,
+def _save_verbose(
+    img_original: Image.Image,
+    out_arr: np.ndarray,
+    col_breaks: np.ndarray,
+    row_breaks: np.ndarray,
+    col_synth: np.ndarray,
+    row_synth: np.ndarray,
+    stem: str,
+    output_dir: Path,
+    edges_overlay: Image.Image | None = None,
 ) -> None:
-    sep = "-" * 46
-    print(f"\n{sep}")
-    print("  Resize Report")
-    print(sep)
-    print(f"  Input  resolution : {W} x {H} px")
-    print(f"  Output resolution : {W_out} x {H_out} px")
-    print(f"  Downsampling      : {W_out/W*100:.2f}% width / {H_out/H*100:.2f}% height")
-    row_tag = "consistent" if row_cv < 0.25 else "irregular"
-    col_tag = "consistent" if col_cv < 0.25 else "irregular"
-    print(f"  Row spacing CV    : {row_cv:.3f}  ({row_tag})")
-    print(f"  Col spacing CV    : {col_cv:.3f}  ({col_tag})")
-    print(f"  Strategy          : {strategy}")
-    print(f"  Compare true scale: {compare_true_scale}x  "
-          f"({W_out * compare_true_scale} x {H_out * compare_true_scale} px)")
-    print(sep)
+    """Save the edges overlay, compare, and compare_true verbose images."""
+    H_orig, W_orig = np.array(img_original).shape[:2]
+
+    # Edges overlay (use pre-built one if provided, e.g. for tiled mode)
+    edges_path = output_dir / (stem + "_edges.png")
+    if edges_overlay is None:
+        edges_overlay = make_grid_overlay(img_original, col_breaks, row_breaks, col_synth, row_synth)
+    edges_overlay.save(str(edges_path))
+    print(f"  Saved: {edges_path}")
+
+    # Compare: output scaled back to original size
+    out_pil = Image.fromarray(out_arr.clip(0, 255).astype(np.uint8))
+    compare = out_pil.resize((W_orig, H_orig), Image.NEAREST)
+    compare_path = output_dir / (stem + "_compare.png")
+    compare.save(str(compare_path))
+    print(f"  Saved: {compare_path}")
+
+    # Compare true: output scaled up by largest integer factor that fits
+    out_h, out_w = out_arr.shape[:2]
+    if out_w > 0 and out_h > 0:
+        factor = max(1, min(W_orig // out_w, H_orig // out_h))
+        compare_true = out_pil.resize((out_w * factor, out_h * factor), Image.NEAREST)
+        ct_path = output_dir / (stem + "_compare_true.png")
+        compare_true.save(str(ct_path))
+        print(f"  Saved: {ct_path}")
 
 
 # ---------------------------------------------------------------------------
-# Per-file processing
-# ---------------------------------------------------------------------------
-
-def process_file(
-    input_path: Path,
-    output_path: Path,
-    edge_percentile: float,
-    sample_method: str,
-    force_regular: bool,
-    force_irregular: bool,
-    scale: float,
-    verbose: bool,
-    tile_size: tuple[int, int] | None = None,
-    flags_suffix: str = "",
-    square: bool = False,
-    max_gap_ratio: float = 1.6,
-) -> None:
-    print(f"Loading: {input_path}")
-    img, arr = load_image(str(input_path))
-    H, W = arr.shape[:2]
-    print(f"  {W} x {H} px")
-
-    print("Detecting virtual pixel grid ...")
-    mag_h, mag_v = compute_gradients(arr)
-    pixel_w, pixel_h, col_breaks, row_breaks = detect_pixel_grid(
-        mag_h, mag_v, edge_percentile, max_gap_ratio
-    )
-
-    raw_pixel_w = raw_pixel_h = None
-    if pixel_w is None or pixel_h is None:
-        if force_regular:
-            print(
-                "Error: --force-regular requested but period could not be estimated. "
-                "Try adjusting --edge-percentile.",
-                file=sys.stderr,
-            )
-            return
-        art_w = len(_breaks_to_spans(col_breaks, W))
-        art_h = len(_breaks_to_spans(row_breaks, H))
-        print(f"  Period estimation failed; falling back to {art_w} x {art_h} detected spans")
-    else:
-        pixel_w /= scale
-        pixel_h /= scale
-        raw_pixel_w, raw_pixel_h = pixel_w, pixel_h   # save before squaring
-        if square:
-            avg = (pixel_w + pixel_h) / 2.0
-            pixel_w = pixel_h = avg
-        art_w = max(1, round(W / pixel_w))
-        art_h = max(1, round(H / pixel_h))
-        print(f"  Virtual pixel size : {pixel_w:.2f} x {pixel_h:.2f} px"
-              + (f"  (scale {scale}x)" if scale != 1.0 else ""))
-        print(f"  Expected art size  : {art_w} x {art_h} px")
-
-    row_cv = _spacing_cv(row_breaks)
-    col_cv = _spacing_cv(col_breaks)
-
-    use_regular = (pixel_w is not None and pixel_h is not None) and not force_irregular
-    if force_regular:
-        use_regular = True
-    if force_irregular:
-        use_regular = False
-
-    tile_suffix = ""
-    if tile_size is not None:
-        tw, th = tile_size
-        n_cols = -(-W // tw)  # ceil division
-        n_rows = -(-H // th)
-        tile_suffix = f" tiled {n_cols}x{n_rows}"
-        print(f"  Tiling: {n_cols} x {n_rows} tiles of {tw} x {th} px")
-
-    if tile_size is not None:
-        tw, th = tile_size
-        strategy = ("regular" if use_regular else f"irregular span {sample_method}") + tile_suffix
-        out_img = _downsample_tiled(
-            arr, pixel_w, pixel_h, col_breaks, row_breaks,
-            tw, th, edge_percentile, sample_method, use_regular, scale, square,
-            raw_pixel_w, raw_pixel_h,
-        )
-        # Effective breaks for edge overlay: derive from global grid (tiling only adjusts phase)
-        if use_regular:
-            eff_row_breaks = _centers_to_breaks(_regular_centers(pixel_h, H, row_breaks))
-            eff_col_breaks = _centers_to_breaks(_regular_centers(pixel_w, W, col_breaks))
-        else:
-            eff_row_spans = _breaks_to_spans(row_breaks, H)
-            eff_col_spans = _breaks_to_spans(col_breaks, W)
-            _pw, _ph = raw_pixel_w, raw_pixel_h
-            if scale != 1.0 and _ph is not None:
-                if scale > 1.0:
-                    eff_row_spans = _subdivide_spans(eff_row_spans, _ph)
-                else:
-                    eff_row_spans = _merge_spans(eff_row_spans, max(1, round(1.0 / scale)))
-            if scale != 1.0 and _pw is not None:
-                if scale > 1.0:
-                    eff_col_spans = _subdivide_spans(eff_col_spans, _pw)
-                else:
-                    eff_col_spans = _merge_spans(eff_col_spans, max(1, round(1.0 / scale)))
-            eff_row_breaks = _spans_to_breaks(eff_row_spans)
-            eff_col_breaks = _spans_to_breaks(eff_col_spans)
-    elif use_regular:
-        strategy = "regular (nearest-neighbour at grid centers)"
-        row_centers = _regular_centers(pixel_h, H, row_breaks)
-        col_centers = _regular_centers(pixel_w, W, col_breaks)
-        if abs(len(row_centers) - art_h) > 1:
-            print(f"  Warning: regular grid yielded {len(row_centers)} rows, expected {art_h}")
-        if abs(len(col_centers) - art_w) > 1:
-            print(f"  Warning: regular grid yielded {len(col_centers)} cols, expected {art_w}")
-        out_img = _downsample_regular(arr, row_centers, col_centers)
-        eff_row_breaks = _centers_to_breaks(row_centers)
-        eff_col_breaks = _centers_to_breaks(col_centers)
-    else:
-        strategy = f"irregular (span {sample_method} sampling)"
-        row_spans = _breaks_to_spans(row_breaks, H)
-        col_spans = _breaks_to_spans(col_breaks, W)
-        _pw, _ph = raw_pixel_w, raw_pixel_h
-        if scale != 1.0 and _ph is not None:
-            if scale > 1.0:
-                row_spans = _subdivide_spans(row_spans, _ph)
-            else:
-                row_spans = _merge_spans(row_spans, max(1, round(1.0 / scale)))
-        if scale != 1.0 and _pw is not None:
-            if scale > 1.0:
-                col_spans = _subdivide_spans(col_spans, _pw)
-            else:
-                col_spans = _merge_spans(col_spans, max(1, round(1.0 / scale)))
-        eff_row_breaks = _spans_to_breaks(row_spans)
-        eff_col_breaks = _spans_to_breaks(col_spans)
-        if square and _pw is not None and _ph is not None:
-            target_size = min(_pw, _ph)
-            out_img = _downsample_square_padded(arr, row_spans, col_spans, target_size, sample_method)
-        else:
-            if len(row_spans) != art_h:
-                print(f"  Warning: {len(row_spans)} row spans detected, expected {art_h}")
-            if len(col_spans) != art_w:
-                print(f"  Warning: {len(col_spans)} col spans detected, expected {art_w}")
-            out_img = _downsample_irregular(arr, row_spans, col_spans, sample_method)
-
-    W_out, H_out = out_img.size
-    compare_true_scale = max(1, round(min(W / W_out, H / H_out)))
-    _print_report(W, H, W_out, H_out, row_cv, col_cv, strategy, compare_true_scale)
-
-    print(f"\nSaving: {output_path}")
-    out_img.save(str(output_path))
-
-    if verbose:
-        edges_img        = make_grid_overlay(img, eff_col_breaks, eff_row_breaks)
-        if tile_size is not None:
-            edges_img = draw_tile_boundaries(edges_img, tile_size[0], tile_size[1])
-        compare_img      = make_compare(out_img, W, H)
-        compare_true_img = make_compare_true(out_img, W, H)
-
-        edges_path        = input_path.parent / (input_path.stem + f"_edges{flags_suffix}.png")
-        compare_path      = input_path.parent / (input_path.stem + f"_compare{flags_suffix}.png")
-        compare_true_path = input_path.parent / (input_path.stem + f"_compare_true{flags_suffix}.png")
-        print(f"Saving: {edges_path}")
-        edges_img.save(str(edges_path))
-        print(f"Saving: {compare_path}")
-        compare_img.save(str(compare_path))
-        print(f"Saving: {compare_true_path}  ({compare_true_img.size[0]} x {compare_true_img.size[1]} px)")
-        compare_true_img.save(str(compare_true_path))
-
-    print("Done.")
-
-
-# ---------------------------------------------------------------------------
-# Entry point
+# CLI entry point
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     args = docopt(__doc__)
 
-    input_paths  = [Path(p) for p in args["<input>"]]
-    output_arg   = args["--output"]
-    edge_percentile = float(args["--edge-percentile"])
-    sample_method   = args["--sample"]
-    force_regular   = args["--force-regular"]
+    threshold_percentile = float(args["--edge-percentile"])
+    min_luma_diff = float(args["--min-edge"])
+    min_distance = int(args["--min-distance"])
+    cluster_radius = int(args["--cluster-radius"])
+    max_gap_ratio = float(args["--max-gap"])
+    regular_tolerance = float(args["--regular-tolerance"])
+    method = args["--sample"]
+    force_regular = args["--force-regular"]
     force_irregular = args["--force-irregular"]
-    square          = args["--square"]
-    verbose         = args["--verbose"]
-    scale           = float(args["--scale"])
-    max_gap_ratio   = float(args["--max-gap"])
-    tile_size       = None
-    if args["--tile"]:
-        try:
-            tile_size = _parse_tile_size(args["--tile"])
-        except ValueError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
+    scale = float(args["--scale"])
+    square = args["--square"]
+    verbose = args["--verbose"]
+    tile_size = args["--tile"]
 
-    if scale <= 0:
-        print("Error: --scale must be a positive number", file=sys.stderr)
+    valid_methods = {"center", "center_region", "max"}
+    if method not in valid_methods:
+        print(f"Error: --sample must be one of: {', '.join(sorted(valid_methods))}", file=sys.stderr)
         sys.exit(1)
 
-    if sample_method not in ("center", "mean", "median"):
-        print("Error: --sample must be center, mean, or median", file=sys.stderr)
-        sys.exit(1)
+    for input_str in args["<input>"]:
+        input_path = Path(input_str)
+        if not input_path.exists():
+            print(f"Error: file not found: {input_path}", file=sys.stderr)
+            continue
 
-    if output_arg and len(input_paths) > 1:
-        print("Error: --output cannot be used with multiple input files", file=sys.stderr)
-        sys.exit(1)
+        print(f"\nProcessing: {input_path}")
+        img, arr = load_image(str(input_path))
+        H, W = arr.shape[:2]
+        print(f"  {W} x {H} px")
 
-    errors = [p for p in input_paths if not p.exists()]
-    if errors:
-        for p in errors:
-            print(f"Error: file not found: {p}", file=sys.stderr)
-        sys.exit(1)
+        # Determine output path
+        if args["--output"]:
+            output_path = Path(args["--output"])
+        else:
+            vstem = _build_output_stem(input_path.stem, args)
+            output_path = input_path.parent / (vstem + "_pixel.png")
 
-    suffix = _flags_suffix(force_regular, force_irregular, scale, tile_size, square, edge_percentile, max_gap_ratio) if verbose else ""
+        # Downsample
+        if tile_size:
+            tw, th = _parse_tile_size(tile_size)
+            print(f"  Tiled mode: {tw}x{th} tiles")
+            out_arr, tiles_data = _downsample_tiled(
+                arr, tw, th, threshold_percentile, max_gap_ratio,
+                regular_tolerance, force_regular, force_irregular, scale, square,
+                min_luma_diff, method, min_distance, cluster_radius,
+            )
+            # Global detection only for size reporting
+            pixel_w, pixel_h, is_regular_w, is_regular_h, col_breaks, row_breaks, col_synth, row_synth = \
+                detect_pixel_grid_v3(arr, threshold_percentile, max_gap_ratio, regular_tolerance, min_luma_diff,
+                                     min_distance=min_distance, cluster_radius=cluster_radius)
+            tiled_overlay = make_tiled_grid_overlay(img, tiles_data, tw, th)
+        else:
+            pixel_w, pixel_h, is_regular_w, is_regular_h, col_breaks, row_breaks, col_synth, row_synth = \
+                detect_pixel_grid_v3(arr, threshold_percentile, max_gap_ratio, regular_tolerance, min_luma_diff,
+                                     min_distance=min_distance, cluster_radius=cluster_radius)
 
-    for input_path in input_paths:
-        output_path = Path(output_arg) if output_arg else (
-            input_path.parent / (input_path.stem + f"_pixel{suffix}.png")
-        )
-        process_file(
-            input_path, output_path,
-            edge_percentile, sample_method,
-            force_regular, force_irregular,
-            scale, verbose,
-            tile_size,
-            suffix,
-            square,
-            max_gap_ratio,
-        )
+            mode_str = "regular" if (is_regular_w and is_regular_h and not force_irregular) else "irregular"
+            print(f"  Mode: {mode_str}")
+            if pixel_w:
+                print(f"  Virtual pixel size: ~{pixel_w:.2f} x {pixel_h:.2f} px")
+
+            out_arr = _downsample_single(
+                arr, threshold_percentile, max_gap_ratio, regular_tolerance,
+                force_regular, force_irregular, scale, square, min_luma_diff, method,
+                min_distance, cluster_radius,
+            )
+
+        out_h, out_w = out_arr.shape[:2]
+        print(f"  Output: {out_w} x {out_h} px")
+
+        # Save main output
+        out_pil = Image.fromarray(out_arr.clip(0, 255).astype(np.uint8))
+        out_pil.save(str(output_path))
+        print(f"  Saved: {output_path}")
+
+        # Verbose outputs
+        if verbose:
+            vstem = _build_output_stem(input_path.stem, args)
+            overlay = tiled_overlay if tile_size else None
+            _save_verbose(img, out_arr, col_breaks, row_breaks, col_synth, row_synth,
+                          vstem, input_path.parent, edges_overlay=overlay)
 
 
 if __name__ == "__main__":

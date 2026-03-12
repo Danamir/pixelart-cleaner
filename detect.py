@@ -1,60 +1,48 @@
 #!/usr/bin/env python3
 """Detect the virtual pixel grid in an AI-generated pixel-art image.
 
-Outputs a grid-line overlay image (original resolution) marking the detected
-horizontal and vertical breaks between virtual pixels, and prints detection
-statistics:
-  - number of detected pixel-row / pixel-column break lines
-  - virtual pixel height and width
-  - projected pixel-art resolution and downsampling ratio
-  - estimated colour palette size
-
-Algorithm
----------
-For each axis the detection runs in two steps:
-
-  1. Break profile  -- for each row position r, count the fraction of columns
-     that show a significant top-to-bottom colour change at r (and vice-versa
-     for columns).  Peaks in this 1-D profile are the detected break lines.
-
-  2. Period recovery -- given the (sparse) detected break positions, sweep all
-     integer pixel-art sizes and score each by how well a regular grid with
-     that period aligns with the breaks (Gaussian residual over the best phase
-     offset).  The integer art size with the best score gives the exact pixel
-     period (= image dimension / art size).
-
-     Using integer art sizes avoids the sub-harmonic aliasing that trips up
-     free-period FFT / comb approaches, and directly yields a physically
-     meaningful output (whole pixel-art pixel count).
+Compares adjacent rows (or columns) using the luma channel to find where
+significant brightness changes occur across the full line pair, marking
+virtual pixel boundaries.  Heights/widths between detected breaks are
+collected and analysed to determine whether the grid is regular or irregular.
 
 Usage:
-    detect.py <input> [--output=PATH] [--edge-percentile=P] [--palette-colors=N] [-g R] [--edge-only]
+    detect.py <input> [--output=PATH] [--edge-percentile=P] [--palette-colors=N]
+               [-g R] [-t T] [-e E] [-d D] [-c C] [--edge-only]
     detect.py -h | --help
 
 Arguments:
-    <input>                 Input image path.
+    <input>                     Input image path.
 
 Options:
-    -o PATH --output=PATH       Output image path (default: <input>_edges.<ext>).
-    --edge-percentile=P         Gradient percentile threshold for break detection, 0-100 [default: 85].
-    --palette-colors=N          Max colours for palette quantisation [default: 256].
-    -g R --max-gap=R            Max gap ratio before subdividing: gaps wider than R * period are split.
-                                Increase to allow wider virtual pixels to survive un-subdivided [default: 1.6].
-    --edge-only                 Output a greyscale grid-line image instead of a colour overlay.
+    -o PATH --output=PATH       Output image path.
+    -p P --edge-percentile=P    Per-pixel luma-diff percentile threshold [default: 85].
+    --palette-colors=N          Max colours for palette report [default: 256].
+    -g R --max-gap=R            Max gap ratio before subdividing [default: 1.6].
+    -t T --regular-tolerance=T  Span-size tolerance for regularity check (0-1) [default: 0.10].
+    -e E --min-edge=E           Minimum absolute luma difference to count as an edge (0-255).
+                                Prevents near-zero thresholds on flat/sparse backgrounds [default: 10].
+    -d D --min-distance=D       Minimum distance in px between two peaks in the break profile.
+                                Lower to detect breaks closer together than 3 px [default: 3].
+    -c C --cluster-radius=C     Max distance in px to merge nearby band votes into one break.
+                                Lower to preserve closely-spaced breaks [default: 1].
+    --edge-only                 Output a greyscale grid image instead of a colour overlay.
     -h --help                   Show this screen.
 """
 
 import sys
+from collections import Counter
 from pathlib import Path
+from math import ceil
 
-from docopt import docopt
-from scipy.signal import find_peaks
 import numpy as np
+from docopt import docopt
 from PIL import Image
+from scipy.signal import find_peaks
 
 
 # ---------------------------------------------------------------------------
-# Image loading
+# Image loading / colour conversion
 # ---------------------------------------------------------------------------
 
 def load_image(path: str) -> tuple[Image.Image, np.ndarray]:
@@ -63,291 +51,342 @@ def load_image(path: str) -> tuple[Image.Image, np.ndarray]:
     return img, np.array(img, dtype=np.float32)
 
 
-# ---------------------------------------------------------------------------
-# Gradient computation
-# ---------------------------------------------------------------------------
-
-def compute_gradients(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Compute per-pixel colour-gradient magnitudes along each axis.
-
-    Returns
-    -------
-    mag_h : ndarray, shape (H, W-1)
-        Magnitude of the horizontal colour difference (left to right).
-    mag_v : ndarray, shape (H-1, W)
-        Magnitude of the vertical colour difference (top to bottom).
-    """
-    grad_h = np.diff(arr, axis=1)          # (H, W-1, 3)
-    grad_v = np.diff(arr, axis=0)          # (H-1, W, 3)
-    mag_h = np.sqrt((grad_h ** 2).sum(axis=2))
-    mag_v = np.sqrt((grad_v ** 2).sum(axis=2))
-    return mag_h, mag_v
+def to_luma(arr: np.ndarray) -> np.ndarray:
+    """Convert RGB float32 (H, W, 3) to Rec.601 luma (H, W), range 0-255."""
+    return 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
 
 
 # ---------------------------------------------------------------------------
-# Break-line detection
+# Break detection from luma line comparisons
 # ---------------------------------------------------------------------------
 
-def compute_break_profile(
-    mag: np.ndarray,
+def compute_break_fractions(
+    L: np.ndarray,
     threshold_percentile: float,
-    along_axis: int,
+    axis: int,
+    min_luma_diff: float = 10.0,
 ) -> np.ndarray:
     """
-    Compute a 1-D break score profile normalised over *active* positions.
+    For each pair of adjacent lines along `axis`, compute the fraction of
+    *active* perpendicular positions where the luma difference exceeds the
+    threshold.
 
-    For each position along `along_axis`, the score is the fraction of
-    *active* pixels in the perpendicular direction whose gradient magnitude
-    exceeds the threshold.
+    axis=0 : compare consecutive rows    -> profile length H-1 (row breaks)
+    axis=1 : compare consecutive columns -> profile length W-1 (col breaks)
 
-    An active column (for row-break profiles) is any column that fires above
-    the threshold at least once anywhere in the image — i.e. a column that
-    contains sprite content rather than flat background.  Normalising by
-    active positions rather than total image width/height means that a break
-    covering only a small sprite on a large uniform background still scores
-    near 1.0, instead of being diluted to sprite_width / image_width.
+    Two robustness measures are applied:
 
-    Parameters
-    ----------
-    mag : ndarray
-        Gradient magnitude array.
-        Pass mag_v (H-1, W) with along_axis=1 for row breaks.
-        Pass mag_h (H, W-1) with along_axis=0 for column breaks.
-    threshold_percentile : float
-        Percentile of all values in `mag` used as the detection threshold.
-    along_axis : int
-        Axis to aggregate over (1 = row breaks from mag_v, 0 = col breaks from mag_h).
+    1. Minimum absolute threshold (`min_luma_diff`): the effective threshold is
+       max(percentile_threshold, min_luma_diff).  This prevents near-zero
+       thresholds on images with mostly flat/white backgrounds, where the
+       percentile of all diffs can land in the noise floor.
+
+    2. Active-position normalisation: the fraction is computed only over
+       perpendicular positions that fire above threshold at least once in the
+       image (i.e. are part of sprite content, not flat background).  This
+       prevents a small figure on a wide background from having its boundary
+       signal diluted by the vast expanse of inactive columns/rows.
     """
-    threshold = np.percentile(mag, threshold_percentile)
-    high = mag > threshold
+    diffs = np.abs(np.diff(L, axis=axis))       # (H-1, W) or (H, W-1)
+    threshold = max(float(np.percentile(diffs, threshold_percentile)), min_luma_diff)
+    exceed = diffs > threshold
+    perp = 1 - axis
 
-    # Active slice mask: perpendicular positions that fire above threshold
-    # at least once (i.e. are part of the sprite, not flat background).
-    # For along_axis=1 (row profile): active columns = high.any(axis=0)  shape (W,)
-    # For along_axis=0 (col profile): active rows    = high.any(axis=1)  shape (H,)
-    perp_axis = 1 - along_axis
-    active = high.any(axis=perp_axis)
-
+    # Active positions: those that fire above threshold at least once
+    active = exceed.any(axis=axis)              # shape: (W,) or (H,)
     if not active.any():
-        return high.astype(float).mean(axis=along_axis)
+        return np.zeros(diffs.shape[axis], dtype=float)
 
-    # Restrict to active slices and compute mean along the profile axis
-    restricted = np.compress(active, high, axis=along_axis)
-    return restricted.astype(float).mean(axis=along_axis)
+    restricted = np.compress(active, exceed, axis=perp)
+    return restricted.mean(axis=perp)           # (H-1,) or (W-1,)
 
 
-def find_break_positions(
-    profile: np.ndarray,
+def find_breaks_in_profile(
+    fractions: np.ndarray,
     min_distance: int = 3,
 ) -> np.ndarray:
     """
-    Find positions of significant colour breaks as peaks in a break profile.
+    Find peak positions in a fraction profile that mark virtual pixel boundaries.
 
-    Returns an array of integer indices into `profile` where peaks occur.
-    The height threshold is adaptive: a peak must exceed both 5 % of the
-    profile maximum and 1.5 x the profile mean, whichever is larger.
+    The adaptive height threshold requires peaks to exceed both 5% of the
+    profile maximum and 1.5x the profile mean.
     """
-    if profile.max() < 1e-10:
+    if fractions.max() < 1e-10:
         return np.array([], dtype=int)
-    height = max(profile.max() * 0.05, profile.mean() * 1.5)
-    peaks, _ = find_peaks(profile, height=height, distance=min_distance)
+    height = max(fractions.max() * 0.05, fractions.mean() * 1.5)
+    peaks, _ = find_peaks(fractions, height=height, distance=min_distance)
     return peaks
 
 
-def _score_art_size(
-    positions: np.ndarray,
-    image_length: int,
-    n: int,
-    tolerance: float,
-) -> float:
+def detect_breaks_banded(
+    L: np.ndarray,
+    threshold_percentile: float,
+    axis: int,
+    min_luma_diff: float = 10.0,
+    band_size: int = 64,
+    min_votes: int = 1,
+    cluster_radius: int = 2,
+    min_distance: int = 3,
+) -> np.ndarray:
     """
-    Score a candidate pixel-art size `n` (meaning `n` virtual pixels along an
-    axis of length `image_length`).
+    Detect break positions by splitting into perpendicular bands and voting.
 
-    For each detected break position used as phase anchor, compute the
-    Gaussian-weighted residual between every detected position and the nearest
-    grid line of the regular grid (period = image_length / n).  Return the
-    maximum score across all phase anchors.
+    For row breaks (axis=0): slices the image into vertical column bands of
+    `band_size` px, detects row breaks independently in each band, then
+    collects positions that appear in at least `min_votes` bands.
+
+    For col breaks (axis=1): same idea using horizontal row bands.
+
+    Within each band the active-position normalisation is local to that band,
+    so a small feature spanning only a few pixels in the perpendicular
+    direction produces full-strength peaks — rather than being diluted by the
+    rest of the image.  Positions appearing in enough bands are genuine; noise
+    confined to a single band doesn't vote enough to survive.
+
+    Nearby positions from different bands are merged (weighted mean by votes).
     """
-    p = image_length / n
-    best = 0.0
-    for anchor in positions:
-        phase   = anchor % p
-        rem     = (positions - phase) % p
-        aligned = np.minimum(rem, p - rem)
-        s = float(np.exp(-0.5 * (aligned / tolerance) ** 2).mean())
-        if s > best:
-            best = s
-    return best
+    H, W = L.shape
+    n_band_dim = W if axis == 0 else H
 
+    votes: Counter = Counter()
 
-def estimate_pixel_period(
-    positions: np.ndarray,
-    image_length: int,
-    tolerance: float = 1.0,
-    min_period: float = 3.0,
-) -> float | None:
-    """
-    Estimate the virtual pixel period (in original pixels) from detected break
-    positions by sweeping integer pixel-art sizes.
+    for band_start in range(0, n_band_dim, band_size):
+        band_end = min(band_start + band_size, n_band_dim)
+        band_L = L[:, band_start:band_end] if axis == 0 else L[band_start:band_end, :]
 
-    Pixel art always has integer pixel counts, so the true period is exactly
-    image_length / n for some integer n.  For each candidate n in
-    [2, image_length // min_period], we score how well a regular grid with
-    period image_length/n aligns with the detected breaks (optimising over
-    phase).  The best-scoring integer n gives the exact pixel period.
+        fracs = compute_break_fractions(band_L, threshold_percentile, axis, min_luma_diff)
+        if fracs.max() < 1e-10:
+            continue
 
-    Returns None if no candidate scores above the minimum confidence (0.3).
-    """
-    if len(positions) < 2:
-        return None
-    max_art = int(image_length // min_period)
-    if max_art < 2:
-        return None
+        peaks = find_breaks_in_profile(fracs, min_distance=min_distance)
+        for p in peaks:
+            votes[int(p)] += 1
 
-    best_n, best_score = None, 0.0
-    for n in range(2, max_art + 1):
-        s = _score_art_size(positions, image_length, n, tolerance)
-        if s > best_score:
-            best_score, best_n = s, n
+    candidates = sorted(pos for pos, count in votes.items() if count >= min_votes)
+    if not candidates:
+        return np.array([], dtype=float)
 
-    if best_n is None or best_score < 0.3:
-        return None
-    return image_length / best_n
+    # Merge nearby positions: weighted mean by vote count
+    clusters = []
+    group = [candidates[0]]
+    group_votes = [votes[candidates[0]]]
+
+    for pos in candidates[1:]:
+        if pos - group[-1] <= cluster_radius:
+            group.append(pos)
+            group_votes.append(votes[pos])
+        else:
+            total = sum(group_votes)
+            clusters.append(sum(p * v for p, v in zip(group, group_votes)) / total)
+            group = [pos]
+            group_votes = [votes[pos]]
+
+    total = sum(group_votes)
+    clusters.append(sum(p * v for p, v in zip(group, group_votes)) / total)
+
+    return np.array(clusters, dtype=float)
 
 
 # ---------------------------------------------------------------------------
-# Break-list refinement using the smoothness constraint
+# Span size analysis and regularity
 # ---------------------------------------------------------------------------
 
-def _fill_missing_breaks(
-    positions: np.ndarray,
+def breaks_to_span_sizes(breaks: np.ndarray, image_length: int) -> np.ndarray:
+    """
+    Convert break positions (gradient space, 0..length-2) to span sizes in pixels.
+
+    A break at index b marks the boundary between pixel b and pixel b+1.
+    Spans: [0..b0], [b0+1..b1], ..., [bN+1..length-1].
+    """
+    bounds = [0] + [int(b) + 1 for b in sorted(breaks)] + [image_length]
+    return np.array([bounds[i + 1] - bounds[i] for i in range(len(bounds) - 1)], dtype=float)
+
+
+def analyze_regularity(
+    span_sizes: np.ndarray,
+    tolerance_frac: float = 0.10,
+    outlier_ratio: float = 3.0,
+    min_close_frac: float = 0.80,
+) -> tuple[bool, float]:
+    """
+    Determine whether detected virtual pixel sizes indicate a regular grid.
+
+    1. Compute median span size.
+    2. Filter out spans > outlier_ratio * median (art gaps, not vp boundaries).
+    3. Re-compute median on the filtered set.
+    4. If >= min_close_frac of filtered spans are within tolerance_frac of
+       the new median, the grid is considered regular.
+
+    Returns (is_regular, median_size).
+    """
+    if len(span_sizes) == 0:
+        return False, 0.0
+
+    median = float(np.median(span_sizes))
+    if median < 2.0:
+        return False, median
+
+    filtered = span_sizes[span_sizes <= outlier_ratio * median]
+    if len(filtered) == 0:
+        return False, median
+
+    median = float(np.median(filtered))
+    close = np.abs(filtered - median) / median <= tolerance_frac
+    is_regular = float(close.mean()) >= min_close_frac
+    return is_regular, median
+
+
+# ---------------------------------------------------------------------------
+# Break list refinement
+# ---------------------------------------------------------------------------
+
+def fill_missing_breaks(
+    breaks: np.ndarray,
     period: float,
     image_length: int,
     max_gap_ratio: float = 1.6,
 ) -> np.ndarray:
     """
-    Insert synthetic breaks into gaps that are too wide for a single period.
+    Insert synthetic breaks in spans wider than max_gap_ratio * period.
 
-    Handles three kinds of gaps:
-      - leading  : from the image start (pixel 0) to the first break
-      - internal : between consecutive detected breaks
-      - trailing : from the last break to the image end
-
-    A break at gradient-space position b means a pixel boundary at b+1.
-    The leading span size is therefore first_break + 1, and the trailing
-    span size is image_length - last_break - 1.
-
-    Any span wider than max_gap_ratio * period is subdivided into
-    round(span / period) equal intervals by inserting synthetic breaks.
+    Handles leading, internal, and trailing gaps.
     """
-    filled = sorted(positions.tolist())
+    filled = sorted(float(b) for b in breaks)
 
-    def _insert_breaks_in_span(span_start_px: float, span_size: float) -> list[float]:
-        """Return synthetic break positions (gradient space) for one oversized span."""
-        n_insert = round(span_size / period) - 1
-        if n_insert <= 0:
+    def _insert(span_start: float, span_size: float) -> list[float]:
+        n = round(span_size / period) - 1
+        if n <= 0:
             return []
-        step = span_size / (n_insert + 1)
-        # Boundary k is at pixel span_start_px + k*step; break = boundary - 1
-        return [span_start_px + step * (j + 1) - 1 for j in range(n_insert)]
+        step = span_size / (n + 1)
+        return [span_start + step * (j + 1) - 1 for j in range(n)]
 
-    # Leading edge
     if filled:
-        leading_size = filled[0] + 1          # pixels in [0, first_break+1)
-        if leading_size > period * max_gap_ratio:
-            filled = _insert_breaks_in_span(0, leading_size) + filled
+        leading = filled[0] + 1
+        if leading > period * max_gap_ratio:
+            filled = _insert(0, leading) + filled
 
-    # Internal gaps
     i = 0
     while i < len(filled) - 1:
-        gap = filled[i + 1] - filled[i]       # gradient-space distance
-        span_size = gap                        # also equals pixel span size here
-        if span_size > period * max_gap_ratio:
-            new_breaks = _insert_breaks_in_span(filled[i] + 1, span_size)
-            if new_breaks:
-                filled = filled[:i + 1] + new_breaks + filled[i + 1:]
-                i += len(new_breaks)
+        gap = filled[i + 1] - filled[i]
+        if gap > period * max_gap_ratio:
+            new = _insert(filled[i] + 1, gap)
+            if new:
+                filled = filled[: i + 1] + new + filled[i + 1 :]
+                i += len(new)
         i += 1
 
-    # Trailing edge
     if filled:
-        trailing_size = image_length - (filled[-1] + 1)   # pixels after last break
-        if trailing_size > period * max_gap_ratio:
-            filled = filled + _insert_breaks_in_span(filled[-1] + 1, trailing_size)
+        trailing = image_length - (filled[-1] + 1)
+        if trailing > period * max_gap_ratio:
+            filled = filled + _insert(filled[-1] + 1, trailing)
 
     return np.array(sorted(filled))
 
 
-def _remove_close_breaks(positions: np.ndarray, period: float, min_ratio: float = 0.5) -> np.ndarray:
-    """
-    Remove break positions that are too close together (< min_ratio * period).
-
-    Keeps the first of any cluster of closely-spaced breaks (likely double
-    detections at the same boundary).
-    """
-    if len(positions) < 2:
-        return positions
+def remove_close_breaks(breaks: np.ndarray, period: float, min_ratio: float = 0.5) -> np.ndarray:
+    """Remove break positions closer than min_ratio * period (duplicate detections)."""
+    if len(breaks) < 2:
+        return breaks
     min_spacing = period * min_ratio
-    filtered = [positions[0]]
-    for p in positions[1:]:
-        if p - filtered[-1] >= min_spacing:
-            filtered.append(p)
-    return np.array(filtered)
+    kept = [float(breaks[0])]
+    for b in breaks[1:]:
+        if float(b) - kept[-1] >= min_spacing:
+            kept.append(float(b))
+    return np.array(kept)
 
 
 # ---------------------------------------------------------------------------
-# Grid detection (combines both axes)
+# Combined detection pipeline
 # ---------------------------------------------------------------------------
 
-def detect_pixel_grid(
-    mag_h: np.ndarray,
-    mag_v: np.ndarray,
+def _synth_breaks(before: np.ndarray, after: np.ndarray) -> np.ndarray:
+    """Return positions in `after` that are not within 1 px of any position in `before`."""
+    if len(before) == 0:
+        return after.copy()
+    return np.array(
+        [b for b in after if np.min(np.abs(before - b)) > 1.0],
+        dtype=float,
+    )
+
+
+def detect_pixel_grid_v3(
+    arr: np.ndarray,
     threshold_percentile: float,
     max_gap_ratio: float = 1.6,
-) -> tuple[float | None, float | None, np.ndarray, np.ndarray]:
+    regular_tolerance: float = 0.10,
+    min_luma_diff: float = 10.0,
+    min_distance: int = 3,
+    cluster_radius: int = 1,
+) -> tuple[float | None, float | None, bool, bool, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Detect the virtual pixel grid via horizontal and vertical break-line detection.
+    Detect the virtual pixel grid using luma line-pair comparisons.
+
+    For each axis:
+      1. Compute per-line-pair fraction of pixels exceeding luma-diff threshold.
+      2. Find peaks in the fraction profile -> break positions.
+      3. Compute span sizes between breaks.
+      4. Analyse regularity (median + 80% within tolerance).
+      5. If regular, fill missing breaks and remove duplicates.
 
     Returns
     -------
-    pixel_w : estimated virtual pixel width  (None if undetected)
-    pixel_h : estimated virtual pixel height (None if undetected)
-    col_breaks : column indices of detected vertical break lines  (into W-1 space)
-    row_breaks : row indices of detected horizontal break lines   (into H-1 space)
+    pixel_w      : median virtual pixel width  in px (None if undetectable)
+    pixel_h      : median virtual pixel height in px (None if undetectable)
+    is_regular_w : True if column grid is regular
+    is_regular_h : True if row grid is regular
+    col_breaks   : all column break positions (gradient space 0..W-2)
+    row_breaks   : all row break positions    (gradient space 0..H-2)
+    col_synth    : subset of col_breaks that were inserted by gap-filling
+    row_synth    : subset of row_breaks that were inserted by gap-filling
     """
-    H = mag_v.shape[0] + 1
-    W = mag_h.shape[1] + 1
+    L = to_luma(arr)
+    H, W = L.shape
 
-    # Row breaks — peaks in fraction-of-active-columns voting for a vertical edge at each row
-    row_profile = compute_break_profile(mag_v, threshold_percentile, along_axis=1)
-    row_breaks  = find_break_positions(row_profile)
-    pixel_h     = estimate_pixel_period(row_breaks, H)
-    if pixel_h is not None:
-        row_breaks = _remove_close_breaks(row_breaks, pixel_h)
-        row_breaks = _fill_missing_breaks(row_breaks, pixel_h, H, max_gap_ratio)
+    # Row breaks (compare consecutive rows, banded over columns)
+    row_breaks = detect_breaks_banded(L, threshold_percentile, axis=0,
+                                      min_luma_diff=min_luma_diff,
+                                      cluster_radius=cluster_radius,
+                                      min_distance=min_distance)
+    row_sizes = breaks_to_span_sizes(row_breaks, H)
+    is_regular_h, pixel_h = analyze_regularity(row_sizes, regular_tolerance)
+    row_synth = np.array([], dtype=float)
+    if pixel_h > 2.0:
+        row_breaks = remove_close_breaks(row_breaks, pixel_h)
+        row_breaks_filled = fill_missing_breaks(row_breaks, pixel_h, H, max_gap_ratio)
+        row_synth = _synth_breaks(row_breaks, row_breaks_filled)
+        row_breaks = row_breaks_filled
 
-    # Column breaks — peaks in fraction-of-active-rows voting for a horizontal edge at each col
-    col_profile = compute_break_profile(mag_h, threshold_percentile, along_axis=0)
-    col_breaks  = find_break_positions(col_profile)
-    pixel_w     = estimate_pixel_period(col_breaks, W)
-    if pixel_w is not None:
-        col_breaks = _remove_close_breaks(col_breaks, pixel_w)
-        col_breaks = _fill_missing_breaks(col_breaks, pixel_w, W, max_gap_ratio)
+    # Column breaks (compare consecutive columns, banded over rows)
+    col_breaks = detect_breaks_banded(L, threshold_percentile, axis=1,
+                                      min_luma_diff=min_luma_diff,
+                                      cluster_radius=cluster_radius,
+                                      min_distance=min_distance)
+    col_sizes = breaks_to_span_sizes(col_breaks, W)
+    is_regular_w, pixel_w = analyze_regularity(col_sizes, regular_tolerance)
+    col_synth = np.array([], dtype=float)
+    if pixel_w > 2.0:
+        col_breaks = remove_close_breaks(col_breaks, pixel_w)
+        col_breaks_filled = fill_missing_breaks(col_breaks, pixel_w, W, max_gap_ratio)
+        col_synth = _synth_breaks(col_breaks, col_breaks_filled)
+        col_breaks = col_breaks_filled
 
-    return pixel_w, pixel_h, col_breaks, row_breaks
+    return (
+        pixel_w if pixel_w > 0 else None,
+        pixel_h if pixel_h > 0 else None,
+        is_regular_w,
+        is_regular_h,
+        col_breaks,
+        row_breaks,
+        col_synth,
+        row_synth,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Colour palette
+# Palette counting
 # ---------------------------------------------------------------------------
 
 def count_palette_colors(img: Image.Image, max_colors: int = 256) -> int:
-    """
-    Quantize the image to at most `max_colors` colours and return how many
-    distinct palette entries are actually used.
-    """
     quantized = img.quantize(
         colors=max_colors,
         method=Image.Quantize.MEDIANCUT,
@@ -360,35 +399,60 @@ def count_palette_colors(img: Image.Image, max_colors: int = 256) -> int:
 # Output images
 # ---------------------------------------------------------------------------
 
+_DOT_SIZE = 0  # pixels on / off for dotted synthetic lines
+
+
+def _dot_mask(length: int) -> np.ndarray:
+    """Boolean mask with alternating DOT_SIZE-pixel on/off segments."""
+    idx = np.arange(length)
+    if _DOT_SIZE <= 0: return idx
+    return (idx // _DOT_SIZE) % 2 == 0
+
+
 def make_grid_overlay(
     original: Image.Image,
     col_breaks: np.ndarray,
     row_breaks: np.ndarray,
+    col_synth: np.ndarray | None = None,
+    row_synth: np.ndarray | None = None,
     row_color: tuple[int, int, int] = (255, 50, 50),
     col_color: tuple[int, int, int] = (50, 50, 255),
     alpha: float = 0.85,
+    synth_alpha: float = 0.33,
 ) -> Image.Image:
     """
-    Draw detected break lines over the original image.
+    Draw detected break lines over the original image (red=rows, blue=cols).
 
-    Horizontal lines (row breaks) are drawn in red; vertical lines in blue.
-    Each break at index i is drawn at pixel i+1 (the first row/column of the
-    next virtual pixel).
+    Detected breaks are drawn as solid lines at full `alpha`.
+    Synthetic breaks (gap-filled) are drawn as dotted lines at `synth_alpha`.
     """
     out = np.array(original, dtype=np.float32)
-    cr  = np.array(row_color, dtype=np.float32)
-    cc  = np.array(col_color, dtype=np.float32)
+    cr = np.array(row_color, dtype=np.float32)
+    cc = np.array(col_color, dtype=np.float32)
     H, W = out.shape[:2]
+
+    synth_row_set = set(round(b) for b in (row_synth if row_synth is not None else []))
+    synth_col_set = set(round(b) for b in (col_synth if col_synth is not None else []))
 
     for r in row_breaks:
         r1 = int(r) + 1
-        if 0 <= r1 < H:
-            out[r1, :] = out[r1, :] * (1.0 - alpha) + cr * alpha
+        if not (0 <= r1 < H):
+            continue
+        if round(r) in synth_row_set:
+            mask = _dot_mask(W)
+            out[r1, mask] = out[r1, mask] * (1 - synth_alpha) + cr * synth_alpha
+        else:
+            out[r1, :] = out[r1, :] * (1 - alpha) + cr * alpha
 
     for c in col_breaks:
         c1 = int(c) + 1
-        if 0 <= c1 < W:
-            out[:, c1] = out[:, c1] * (1.0 - alpha) + cc * alpha
+        if not (0 <= c1 < W):
+            continue
+        if round(c) in synth_col_set:
+            mask = _dot_mask(H)
+            out[mask, c1] = out[mask, c1] * (1 - synth_alpha) + cc * synth_alpha
+        else:
+            out[:, c1] = out[:, c1] * (1 - alpha) + cc * alpha
 
     return Image.fromarray(out.clip(0, 255).astype(np.uint8))
 
@@ -397,19 +461,38 @@ def make_grid_only(
     original_size: tuple[int, int],
     col_breaks: np.ndarray,
     row_breaks: np.ndarray,
+    col_synth: np.ndarray | None = None,
+    row_synth: np.ndarray | None = None,
 ) -> Image.Image:
-    """Return a black image with detected grid lines drawn in white."""
+    """
+    Return a black image with grid lines in white.
+
+    Synthetic (gap-filled) breaks are drawn as dotted grey (128).
+    """
     H, W = original_size
     arr = np.zeros((H, W), dtype=np.uint8)
 
+    synth_row_set = set(round(b) for b in (row_synth if row_synth is not None else []))
+    synth_col_set = set(round(b) for b in (col_synth if col_synth is not None else []))
+
     for r in row_breaks:
         r1 = int(r) + 1
-        if 0 <= r1 < H:
+        if not (0 <= r1 < H):
+            continue
+        if round(r) in synth_row_set:
+            mask = _dot_mask(W)
+            arr[r1, mask] = 128
+        else:
             arr[r1, :] = 255
 
     for c in col_breaks:
         c1 = int(c) + 1
-        if 0 <= c1 < W:
+        if not (0 <= c1 < W):
+            continue
+        if round(c) in synth_col_set:
+            mask = _dot_mask(H)
+            arr[mask, c1] = 128
+        else:
             arr[:, c1] = 255
 
     return Image.fromarray(arr, mode="L")
@@ -424,49 +507,52 @@ def print_report(
     H: int,
     pixel_w: float | None,
     pixel_h: float | None,
+    is_regular_w: bool,
+    is_regular_h: bool,
     col_breaks: np.ndarray,
     row_breaks: np.ndarray,
+    col_synth: np.ndarray,
+    row_synth: np.ndarray,
     palette_size: int,
 ) -> None:
     sep = "-" * 46
     print(f"\n{sep}")
-    print("  Detection Report")
+    print("  Detection Report (v3)")
     print(sep)
     print(f"  Original resolution    : {W} x {H} px")
 
-    # Row breaks
-    print(f"  Row breaks detected    : {len(row_breaks)}")
+    n_row_true = len(row_breaks) - len(row_synth)
+    print(f"  Row breaks (true)      : {n_row_true}")
+    print(f"  Row breaks (total)     : {len(row_breaks)}  (+{len(row_synth)} forged)")
     if len(row_breaks) > 1:
-        sp = np.diff(row_breaks.astype(float))
+        sp = np.diff(np.sort(row_breaks.astype(float)))
         sp = sp[sp >= 2]
         if len(sp):
             print(f"  Row spacing (mean/std) : {sp.mean():.1f} +/- {sp.std():.1f} px")
     if pixel_h:
-        print(f"  Virtual pixel height   : ~{pixel_h:.3f} px")
+        reg_label = "regular" if is_regular_h else "irregular"
+        print(f"  Virtual pixel height   : ~{pixel_h:.3f} px  ({reg_label})")
 
-    # Column breaks
-    print(f"  Col breaks detected    : {len(col_breaks)}")
+    n_col_true = len(col_breaks) - len(col_synth)
+    print(f"  Col breaks (true)      : {n_col_true}")
+    print(f"  Col breaks (total)     : {len(col_breaks)}  (+{len(col_synth)} forged)")
     if len(col_breaks) > 1:
-        sp = np.diff(col_breaks.astype(float))
+        sp = np.diff(np.sort(col_breaks.astype(float)))
         sp = sp[sp >= 2]
         if len(sp):
             print(f"  Col spacing (mean/std) : {sp.mean():.1f} +/- {sp.std():.1f} px")
     if pixel_w:
-        print(f"  Virtual pixel width    : ~{pixel_w:.3f} px")
+        reg_label = "regular" if is_regular_w else "irregular"
+        print(f"  Virtual pixel width    : ~{pixel_w:.3f} px  ({reg_label})")
 
-    # Summary
     print(sep)
     if pixel_w and pixel_h:
         art_w = max(1, round(W / pixel_w))
         art_h = max(1, round(H / pixel_h))
-        ds_w  = art_w / W * 100
-        ds_h  = art_h / H * 100
         print(f"  Pixel-art resolution   : {art_w} x {art_h} px")
-        print(f"  Downsampling ratio     : {ds_w:.2f}% width / {ds_h:.2f}% height")
+        print(f"  Downsampling ratio     : {art_w / W * 100:.2f}% / {art_h / H * 100:.2f}%")
     else:
         print("  Pixel-art resolution   : unknown")
-        print("  Downsampling ratio     : unknown")
-
     print(f"  Colour palette size    : ~{palette_size} colours")
     print(sep)
 
@@ -486,33 +572,35 @@ def main() -> None:
     output_path = Path(args["--output"]) if args["--output"] else (
         input_path.parent / (input_path.stem + "_edges.png")
     )
-    edge_percentile = float(args["--edge-percentile"])
-    palette_colors  = int(args["--palette-colors"])
-    max_gap_ratio   = float(args["--max-gap"])
-    edge_only       = args["--edge-only"]
+    threshold_percentile = float(args["--edge-percentile"])
+    palette_colors = int(args["--palette-colors"])
+    max_gap_ratio = float(args["--max-gap"])
+    regular_tolerance = float(args["--regular-tolerance"])
+    min_luma_diff = float(args["--min-edge"])
+    min_distance = int(args["--min-distance"])
+    cluster_radius = int(args["--cluster-radius"])
+    edge_only = args["--edge-only"]
 
     print(f"Loading: {input_path}")
     img, arr = load_image(str(input_path))
     H, W = arr.shape[:2]
     print(f"  {W} x {H} px")
 
-    print("Computing colour gradients ...")
-    mag_h, mag_v = compute_gradients(arr)
-
-    print("Detecting break lines ...")
-    pixel_w, pixel_h, col_breaks, row_breaks = detect_pixel_grid(
-        mag_h, mag_v, edge_percentile, max_gap_ratio
-    )
+    print("Detecting break lines (v3 luma line-pair) ...")
+    pixel_w, pixel_h, is_regular_w, is_regular_h, col_breaks, row_breaks, col_synth, row_synth = \
+        detect_pixel_grid_v3(arr, threshold_percentile, max_gap_ratio, regular_tolerance,
+                             min_luma_diff, min_distance, cluster_radius)
 
     print("Counting colour palette ...")
     palette_size = count_palette_colors(img, palette_colors)
 
-    print_report(W, H, pixel_w, pixel_h, col_breaks, row_breaks, palette_size)
+    print_report(W, H, pixel_w, pixel_h, is_regular_w, is_regular_h,
+                 col_breaks, row_breaks, col_synth, row_synth, palette_size)
 
     if edge_only:
-        out_img = make_grid_only((H, W), col_breaks, row_breaks)
+        out_img = make_grid_only((H, W), col_breaks, row_breaks, col_synth, row_synth)
     else:
-        out_img = make_grid_overlay(img, col_breaks, row_breaks)
+        out_img = make_grid_overlay(img, col_breaks, row_breaks, col_synth, row_synth)
 
     print(f"\nSaving: {output_path}")
     out_img.save(str(output_path))
