@@ -19,7 +19,7 @@ In addition to the downsampled pixel-art output, two comparison images are saved
                        pixel-art pixels).
 
 Usage:
-    resize.py <input>... [--output=PATH] [--edge-percentile=P] [--sample=METHOD]
+    resize.py <input>... [--output=PATH] [-p P] [--sample=METHOD]
               [-r | -i] [-s S] [-t SIZE] [-q] [-v]
     resize.py -h | --help
 
@@ -28,7 +28,7 @@ Arguments:
 
 Options:
     -o PATH --output=PATH       Output image path (default: <input>_pixel.<ext>).
-    --edge-percentile=P         Gradient percentile threshold for break detection [default: 85].
+    -p P --edge-percentile=P    Gradient percentile threshold for break detection [default: 85].
     --sample=METHOD             Sampling method for irregular grids: center, mean, median [default: center].
     -r --force-regular          Force regular-grid strategy regardless of detection quality.
     -i --force-irregular        Force irregular span-based strategy regardless of detection quality.
@@ -446,6 +446,7 @@ def _flags_suffix(
     scale: float,
     tile_size: tuple[int, int] | None,
     square: bool = False,
+    edge_percentile: float = 85.0,
 ) -> str:
     """
     Build a filename suffix encoding the active non-default options, e.g.
@@ -463,6 +464,8 @@ def _flags_suffix(
         parts.append(f"s{scale}")
     if tile_size is not None:
         parts.append(f"t{tile_size[0]}x{tile_size[1]}")
+    if edge_percentile != 85.0:
+        parts.append(f"p{edge_percentile:g}")
     return ("_" + "_".join(parts)) if parts else ""
 
 
@@ -665,7 +668,7 @@ def main() -> None:
             print(f"Error: file not found: {p}", file=sys.stderr)
         sys.exit(1)
 
-    suffix = _flags_suffix(force_regular, force_irregular, scale, tile_size, square) if verbose else ""
+    suffix = _flags_suffix(force_regular, force_irregular, scale, tile_size, square, edge_percentile) if verbose else ""
 
     for input_path in input_paths:
         output_path = Path(output_arg) if output_arg else (
