@@ -2,14 +2,14 @@
 
 ## Project Overview
 
-Python scripts to convert AI-generated pixel-art images into true pixel-art images by detecting the virtual pixel grid and downscaling to the real pixel-art resolution. Two generations exist: v1 (`detect.py` / `resize.py`) and v2 (`detect2.py` / `resize2.py`) with improved detection algorithms.
+Python scripts to convert AI-generated pixel-art images into true pixel-art images by detecting the virtual pixel grid and downscaling to the real pixel-art resolution.
 
 ### Problem Statement
 
 AI-generated pixel art is approximative: colors within a single "virtual pixel" (a rectangular block made of many actual pixels) vary slightly, and the virtual pixel grid is not aligned to a perfect grid. Virtual pixel sizes can also vary — some pixels may be wider or taller than others due to AI generation artifacts. The tool must:
 
-1. Detect virtual pixel boundaries by analyzing color discontinuities between neighboring regions
-2. Estimate the pixel period (regular grid) or enumerate individual spans (irregular grid)
+1. Detect virtual pixel boundaries by analyzing luma discontinuities between adjacent rows/columns
+2. Classify the grid as regular (uniform virtual pixel size) or irregular (variable sizes)
 3. Downsample the image by sampling each detected virtual pixel block
 4. Output a clean, true pixel-art image at the correct reduced resolution
 
@@ -29,12 +29,10 @@ AI-generated pixel art is approximative: colors within a single "virtual pixel" 
 
 ```bash
 # Grid detection only (produces annotated edge overlay)
-venv/Scripts/python.exe detect.py <input> [options]     # v1
-venv/Scripts/python.exe detect2.py <input> [options]    # v2 (consensus)
+venv/Scripts/python.exe detect.py <input> [options]
 
 # Downsampling (main tool)
-venv/Scripts/python.exe resize.py <input>... [options]  # v1
-venv/Scripts/python.exe resize2.py <input>... [options] # v2 (consensus + trimmed sampling)
+venv/Scripts/python.exe resize.py <input>... [options]
 ```
 
 Install dependencies:
@@ -49,10 +47,8 @@ venv/Scripts/pip.exe install -r requirements.txt
 pixelart-cleaner/
 ├── CLAUDE.md
 ├── requirements.txt
-├── detect.py        # v1: Grid detection + edge overlay output
-├── resize.py        # v1: Downsampling using detected grid
-├── detect2.py       # v2: Improved detection (consensus, adaptive fill, 2D refinement)
-├── resize2.py       # v2: Downsampling with v2 detection + trimmed sampling
+├── detect.py        # Grid detection + edge overlay output
+├── resize.py        # Downsampling using detected grid
 └── venv/            # Virtual environment (not committed)
 ```
 
@@ -62,30 +58,70 @@ Test images live in `test.local/` (git-ignored via `*.local` pattern).
 
 ## Algorithm — detect.py
 
-### Step 1: Gradient computation (`compute_gradients`)
+### Step 1: Luma conversion (`to_luma`)
 
-Computes per-pixel color difference magnitudes along each axis:
-- `mag_h` (H, W-1): horizontal differences (left↔right)
-- `mag_v` (H-1, W): vertical differences (top↔bottom)
+Converts the RGB image to a single-channel luma image using Rec.601 weights:
+`L = 0.299·R + 0.587·G + 0.114·B`
 
-### Step 2: Break profile (`compute_break_profile`)
+All boundary detection operates on luma rather than RGB to reduce noise from color variation within a virtual pixel.
 
-For each row position, counts the fraction of **active columns** (columns that ever fire above the gradient threshold) showing a strong vertical gradient there. Normalizing by active columns — not total image width — prevents sparse sprites on large backgrounds from being diluted.
+### Step 2: Per line-pair fractions (`compute_break_fractions`)
 
-### Step 3: Peak detection (`find_break_positions`)
+For each pair of adjacent rows (or columns), computes the fraction of perpendicular positions where the absolute luma difference exceeds a threshold.
 
-Finds peaks in the break profile using `scipy.signal.find_peaks`. The adaptive height threshold is `max(5% of peak, 1.5× mean)`. Minimum distance between peaks: 3 px.
+Two robustness measures:
 
-### Step 4: Period estimation (`estimate_pixel_period`)
+1. **Minimum absolute threshold** (`--min-edge`, default 10): the effective threshold is `max(percentile_threshold, min_luma_diff)`. Prevents near-zero thresholds on images with flat or white/black backgrounds where the percentile of all diffs collapses to noise.
 
-Sweeps all integer art sizes `n` (meaning `n` virtual pixels per axis). For each `n`, scores how well a regular grid with period `image_length / n` aligns with detected breaks (Gaussian residual over the best phase anchor). Returns `image_length / best_n`, or `None` if no candidate scores above 0.3.
+2. **Active-position normalization**: the fraction is computed only over perpendicular positions that fire above threshold at least once anywhere in the image. Prevents a small sprite on a large blank background from being diluted by the inactive background columns/rows.
 
-Using integer art sizes avoids sub-harmonic aliasing from FFT/comb approaches and directly yields a physically meaningful result.
+### Step 3: Peak detection (`find_breaks_in_profile`)
 
-### Step 5: Break refinement
+Finds peaks in the fraction profile using `scipy.signal.find_peaks`. The adaptive height threshold is `max(5% of profile max, 1.5× profile mean)`. Minimum distance between peaks is controlled by `--min-distance` (default 3 px).
 
-- `_remove_close_breaks`: removes duplicate detections closer than `0.5 × period`
-- `_fill_missing_breaks`: inserts synthetic breaks into gaps wider than `max_gap_ratio × period` (default 1.6). Handles leading, internal, and trailing edge gaps.
+### Step 4: Band-based voting (`detect_breaks_banded`)
+
+Rather than running detection once over the full image, splits the image into 64 px-wide perpendicular bands and detects breaks independently per band. Positions are collected into a vote counter; positions appearing in at least `min_votes` bands (default 1) survive.
+
+Nearby surviving positions within `--cluster-radius` px (default 1) are merged into a single break using a vote-weighted mean. This approach makes each band's normalization local, so a feature spanning only a few rows/columns still produces full-strength peaks within its bands instead of being diluted globally.
+
+### Step 5: Regularity analysis (`analyze_regularity`)
+
+Converts break positions to span sizes (pixel distances between consecutive breaks including image edges), then:
+
+1. Computes median span size.
+2. Filters out spans > 3× median (wide art gaps that are not virtual pixel boundaries).
+3. Re-computes median on the filtered set.
+4. If ≥ 80% of filtered spans are within `--regular-tolerance` (default ±10%) of the median, the axis is classified as **regular**.
+
+Returns `(is_regular, median_size)`.
+
+### Step 6: Break refinement
+
+Only applied when a valid period is found (median span > 2 px):
+
+- `remove_close_breaks`: drops duplicate detections closer than `0.5 × period`.
+- `fill_missing_breaks`: inserts synthetic breaks in spans wider than `--max-gap × period` (default 1.6). Handles leading, internal, and trailing gaps. Synthetic breaks are tracked separately for overlay rendering.
+
+### Detection output (`detect_pixel_grid_v3`)
+
+Returns 8 values:
+
+| Value | Description |
+|---|---|
+| `pixel_w` | Median virtual pixel width in px (None if undetectable) |
+| `pixel_h` | Median virtual pixel height in px (None if undetectable) |
+| `is_regular_w` | True if column grid is regular |
+| `is_regular_h` | True if row grid is regular |
+| `col_breaks` | All column break positions |
+| `row_breaks` | All row break positions |
+| `col_synth` | Column breaks inserted by gap-filling |
+| `row_synth` | Row breaks inserted by gap-filling |
+
+### Edge overlay output
+
+- **Color overlay** (default): detected breaks drawn over the original image. True breaks are solid lines (red = rows, blue = columns). Synthetic (gap-filled) breaks are drawn as dotted lines at lower alpha.
+- **Edge-only** (`--edge-only`): black background with white solid lines for true breaks, grey dotted lines for synthetic breaks.
 
 ---
 
@@ -93,105 +129,41 @@ Using integer art sizes avoids sub-harmonic aliasing from FFT/comb approaches an
 
 ### Grid strategy selection
 
-After calling `detect_pixel_grid`, the strategy is chosen:
+After detection, the strategy is chosen:
 
 | Condition | Strategy |
 |---|---|
-| Period estimated, CV low | **Regular** (default) |
-| Period not estimated, or `--force-irregular` | **Irregular** |
-| `--force-regular` | **Regular** (errors if period unavailable) |
-
-Coefficient of variation (CV) of break spacings measures regularity; CV < 0.25 = consistent.
+| Both axes regular, no override | **Regular** |
+| Either axis irregular, or `--force-irregular` | **Irregular** |
+| `--force-regular` | **Regular** (uses period even if irregular) |
 
 ### Regular strategy
 
-Computes phase-corrected grid centers via `_regular_centers`: uses detected breaks to find the best-fitting phase offset (Gaussian alignment), then places one center per virtual pixel at half-period intervals. Samples by nearest-neighbour at each center.
+Uses `regular_grid_spans`: fits a phase offset to the detected break positions via circular mean, then places uniformly spaced spans across the full image at the detected period. This correctly handles sub-pixel grid drift.
+
+With `--square`: averages `pixel_w` and `pixel_h` into a single square period before placing spans.
 
 ### Irregular strategy
 
-Converts detected break positions to `(start, end)` spans covering the full image. Samples each span block independently using the configured method (center, mean, or median).
+Uses `spans_from_breaks`: converts break positions directly to `(start, end)` spans covering the full image. Each span is sampled independently.
 
-### Tiled mode (`--tile`)
+With `--square` (`downsample_square_irregular`): each span is sampled once, then its color is repeated `round(span_size / target_size)` times, where `target_size = min(pixel_w, pixel_h)`. Wide spans produce multiple adjacent identical output pixels rather than being sub-sampled.
 
-Two-pass algorithm:
-1. **Pass 1**: sample each tile independently (local phase correction for regular; global span attribution for irregular)
-2. **Pass 2**: determine canonical output size per strip and pad/assemble tiles
+### Sampling methods (`--sample`)
 
-Spans are attributed to tiles by their center pixel to avoid double-counting at boundaries (`_spans_in_tile`).
-
----
-
-## Algorithm — detect2.py (v2)
-
-Addresses three limitations of v1's detection:
-1. Single-threshold fragility (one `--edge-percentile` controls everything)
-2. Gap-filling requires a global period (fails entirely in irregular mode)
-3. Global 1D projection dilutes breaks that only span part of the image
-
-`detect2.py` imports utility functions from `detect.py` and adds three new stages.
-
-### Step 1: Multi-threshold consensus (`consensus_break_positions`)
-
-Instead of detecting breaks at a single percentile, runs `compute_break_profile` + `find_break_positions` at **7 thresholds** evenly spread over a 30-point percentile range (e.g. 70–100 when center is 85).
-
-Peaks from all thresholds are clustered by proximity (radius 2 px). Each cluster counts how many **distinct thresholds** produced a peak in that neighbourhood. Only clusters with votes from >= 40% of thresholds (minimum 2) survive.
-
-Genuine virtual-pixel boundaries produce strong gradient peaks that persist across many thresholds. Noise and anti-aliasing artefacts only fire at the lowest thresholds and are filtered out.
-
-### Step 2: Period estimation + adaptive gap-filling (`adaptive_fill_breaks`)
-
-Period estimation reuses v1's integer art-size sweep on the (now higher-quality) consensus breaks.
-
-**Key improvement**: when period estimation fails (returns `None`), v1 skips gap-filling entirely. V2 falls back to the **median inter-break spacing** as an approximate period, then runs the same `_fill_missing_breaks` logic. This enables gap-filling in irregular mode where v1 could not.
-
-### Step 3: 2D strip-based refinement (`refine_breaks_2d`)
-
-After independent 1D detection for both axes, v2 cross-validates using the perpendicular axis:
-
-- **Column break refinement**: slices the image into horizontal strips (between row breaks). Within each strip, runs column break detection independently. Positions appearing in >= 2 strips (or >= 1/3 of strips, whichever is smaller) that aren't already detected are added.
-
-- **Row break refinement**: same logic using vertical strips (between column breaks).
-
-This catches breaks that the global 1D projection dilutes — e.g. a vertical boundary that only spans a small sprite on a large uniform background. The per-strip projection concentrates the signal.
-
-### Pipeline order
-
-1. Consensus breaks (both axes)
-2. Period estimation (integer art-size sweep)
-3. Remove close duplicates (if period known)
-4. Adaptive gap-filling (global period or median-spacing fallback)
-5. 2D strip-based refinement
-6. Final duplicate cleanup
-
----
-
-## Algorithm — resize2.py (v2)
-
-`resize2.py` monkey-patches `resize.py` at import time, replacing two components:
-
-### Detection patch
-
-Replaces `detect_pixel_grid` with `detect_pixel_grid_v2` in the `resize` module namespace. Because Python resolves module-level names at call time, this affects all code paths including `_downsample_tiled`'s per-tile detection.
-
-### Boundary-trimmed sampling
-
-AI generators often anti-alias virtual-pixel edges, blending colours from neighbouring pixels into a 1–2 px border zone. V2 replaces `_sample_block` with a trimmed version that **excludes the outer ~15% of each block edge** (for blocks >= 5 px) before sampling. This avoids pulling blended boundary colours into the output.
-
-The trim fraction is fixed at 0.15. It applies to all sampling methods (center, mean, median) in irregular mode, and to `_downsample_square_padded`.
-
-All CLI options are identical to `resize.py`.
-
----
-
-## v1 vs v2: when to use which
-
-| Scenario | Recommendation |
+| Method | Description |
 |---|---|
-| Well-behaved regular grid (uniform pixel sizes) | v1 and v2 produce similar results; either works |
-| Irregular pixel sizes, period estimation fails | v2 — adaptive gap-filling uses median spacing as fallback |
-| Sparse sprite on large background | v2 — 2D strip refinement catches diluted breaks |
-| Threshold-sensitive image (results vary with `-p`) | v2 — consensus is robust across a range of thresholds |
-| Anti-aliased / blurry virtual-pixel boundaries | v2 — trimmed sampling avoids boundary colour bleed |
+| `center` (default) | Single center pixel of the block |
+| `center_region` | Mean of the inner 50% (trims 25% each edge to avoid anti-aliased boundaries) |
+| `max` | Mean of pixels in the most common color bucket (quantizes each channel into 10 levels, finds the dominant bucket, averages actual unquantized pixels in it) |
+
+### Tiled mode (`--tile SIZE`)
+
+Splits the image into tiles (e.g. `64x64`) and runs full detection independently per tile. Useful when virtual pixel sizes vary across the image.
+
+The `_edges.png` verbose output in tiled mode shows per-tile detected breaks translated to global coordinates, with green lines at alpha 0.5 marking tile boundaries.
+
+Note: tiled mode is best suited for irregular grids. Output tiles are assembled with max-height/max-width padding per strip.
 
 ---
 
@@ -199,31 +171,35 @@ All CLI options are identical to `resize.py`.
 
 ### detect.py
 
-| Option | Default | Description |
-|---|---|---|
-| `-o PATH` / `--output` | `<input>_edges.png` | Output path |
-| `--edge-percentile=P` | 85 | Gradient percentile threshold for break detection |
-| `--palette-colors=N` | 256 | Max colors for palette quantization report |
-| `-g R` / `--max-gap=R` | 1.6 | Max gap ratio before subdividing; increase to allow wider virtual pixels |
-| `--edge-only` | off | Output black/white grid instead of color overlay |
-
-### detect2.py
-
-Same options as `detect.py`. Default output path is `<input>_edges2.png`. The `--edge-percentile` value serves as the **center** of the consensus range (actual thresholds span center +/- 15 percentile points).
+| Option | Short | Default | Description |
+|---|---|---|---|
+| `--output=PATH` | `-o` | `<input>_edges.png` | Output path |
+| `--edge-percentile=P` | `-p` | 85 | Luma-diff percentile threshold; raise to ignore weaker boundaries |
+| `--palette-colors=N` | | 256 | Max colors for palette count report |
+| `--max-gap=R` | `-g` | 1.6 | Max gap ratio before gap-filling subdivides a span |
+| `--regular-tolerance=T` | `-t` | 0.10 | Span-size tolerance for regularity check (±fraction of median) |
+| `--min-edge=E` | `-e` | 10 | Minimum absolute luma diff to count as an edge; prevents collapse on flat backgrounds |
+| `--min-distance=D` | `-d` | 3 | Minimum px between two break peaks; lower to detect closely-spaced boundaries |
+| `--cluster-radius=C` | `-c` | 1 | Max px to merge nearby band votes into one break; lower to preserve close breaks |
+| `--edge-only` | | off | Output greyscale grid instead of color overlay |
 
 ### resize.py
 
 | Option | Short | Default | Description |
 |---|---|---|---|
-| `--output=PATH` | `-o` | auto | Output path (auto: `<stem>_pixel.png`) |
-| `--edge-percentile=P` | `-p` | 85 | Gradient threshold; raise (90–98) to detect fewer, stronger breaks |
-| `--sample=METHOD` | | center | Sampling for irregular: `center`, `mean`, `median` |
-| `--max-gap=R` | `-g` | 1.6 | Wider gaps accepted as single virtual pixels before gap-fill subdivides them; raise to 2–4 when legitimately wide pixels exist |
+| `--output=PATH` | `-o` | `<stem>_pixel.png` | Output path |
+| `--edge-percentile=P` | `-p` | 85 | Luma-diff percentile threshold |
+| `--min-edge=E` | `-e` | 10 | Minimum absolute luma diff floor |
+| `--min-distance=D` | `-d` | 3 | Minimum px between break peaks |
+| `--cluster-radius=C` | `-c` | 1 | Max px to merge band votes |
+| `--max-gap=R` | `-g` | 1.6 | Max gap ratio before gap-filling |
+| `--regular-tolerance=T` | | 0.10 | Span-size tolerance for regularity check |
 | `--force-regular` | `-r` | off | Always use regular grid strategy |
 | `--force-irregular` | `-i` | off | Always use irregular span strategy |
-| `--scale=S` | `-s` | 1.0 | Divide detected pixel size by S (S>1 → finer grid, S<1 → coarser) |
-| `--tile=SIZE` | `-t` | off | Local phase correction per tile (e.g. `64x64`); helps drifting grids |
-| `--square` | `-q` | off | Force square output pixels (see below) |
+| `--scale=S` | `-s` | 1.0 | Divide detected pixel size by S (S>1 → finer grid) |
+| `--tile=SIZE` | `-t` | off | Process in independent tiles, e.g. `64x64` |
+| `--sample=METHOD` | `-m` | center | Sampling method: `center`, `center_region`, `max` |
+| `--square` | `-q` | off | Force square output pixels |
 | `--verbose` | `-v` | off | Also save `_edges.png`, `_compare.png`, `_compare_true.png` |
 
 #### Verbose output files
@@ -231,15 +207,11 @@ Same options as `detect.py`. Default output path is `<input>_edges2.png`. The `-
 | File | Description |
 |---|---|
 | `<stem>_pixel.png` | Downsampled pixel-art output (always saved) |
-| `<stem>_edges.png` | Effective sampling grid overlaid on source |
+| `<stem>_edges.png` | Detected grid overlaid on source; in tiled mode shows per-tile breaks + green tile boundaries |
 | `<stem>_compare.png` | Output scaled back to original dimensions (nearest-neighbour) |
-| `<stem>_compare_true.png` | Output scaled up by largest integer factor |
+| `<stem>_compare_true.png` | Output scaled up by largest integer factor that fits |
 
-Verbose filenames encode active non-default options, e.g. `ship_pixel_i_q_g3_p90.png`.
-
-### resize2.py
-
-Same CLI options as `resize.py`. Uses v2 detection and boundary-trimmed sampling automatically.
+Verbose filenames encode active non-default options, e.g. `ship_i_q_g3_p90_pixel.png`.
 
 ---
 
@@ -247,14 +219,14 @@ Same CLI options as `resize.py`. Uses v2 detection and boundary-trimmed sampling
 
 `--square` / `-q` behavior differs by strategy:
 
-**Regular mode**: averages `pixel_w` and `pixel_h` into a single square period before placing grid centers. Produces a grid with equal horizontal and vertical spacing.
+**Regular mode**: averages `pixel_w` and `pixel_h` into a single square period before placing grid centers.
 
-**Irregular mode** (`_downsample_square_padded`): each detected span is sampled **once**. Its color is then repeated `round(span_size / target_size)` times along its axis, where `target_size = min(pixel_w, pixel_h)`. This means:
+**Irregular mode** (`downsample_square_irregular`): each detected span is sampled **once**. Its color is then repeated `round(span_size / target_size)` times along its axis, where `target_size = min(pixel_w, pixel_h)`. This means:
 - A normal span (~`target_size` px) → 1 output pixel
-- A wide/tall span (2× target) → 2 identical output pixels adjacent
+- A wide/tall span (2× target) → 2 identical adjacent output pixels
 - A very wide span preserved by `--max-gap` (3× target) → 3 identical output pixels
 
-No independent sub-sampling of sub-regions is done, so no spurious edge artefacts appear within a single virtual pixel. The output image is larger than without `--square` (extra pixels for wider spans), but each output pixel represents an approximately square source region.
+No independent sub-sampling of sub-regions is done, so no spurious edge artefacts appear within a single virtual pixel.
 
 **Recommended combination for images with wide irregular pixels**:
 ```bash
@@ -265,7 +237,7 @@ venv/Scripts/python.exe resize.py image.png -i -q -g 3.0
 
 ## Debug
 
-- File `test.local/test.png` , 64x64 image with 5x5 virtual pixels forming this shape. Should register 8 true rows, 6 true cols : 
+- File `test.local/test.png`, 64x64 image with 5x5 virtual pixels. Should register 8 true rows, 6 true cols:
 ```
 
     ##
@@ -280,16 +252,15 @@ venv/Scripts/python.exe resize.py image.png -i -q -g 3.0
 
 ```
 
-- File `test.local/test-line.png` , 1152x36 image extacted from an AI generated one, with approximate 5x5 virtual pixels forming this shape. Should register 4 true rows, 8 true cols : 
+- File `test.local/test-line.png`, 1152x36 image extracted from an AI generated one, with approximate 5x5 virtual pixels. Should register 4 true rows, 8 true cols:
 ```
 
-       
+
           ######!
         ##xxxxxxx!##
      ##!xxxxxxxxxxxx##
     #xxxxxxxxxxxxxxxxx#
 ```
-
 
 ---
 
@@ -298,11 +269,12 @@ venv/Scripts/python.exe resize.py image.png -i -q -g 3.0
 | Problem | Likely cause | Fix |
 |---|---|---|
 | Too many breaks detected | Threshold too low | Raise `-p` (e.g. 90, 95) |
-| Wide pixels not detected / over-subdivided | `--max-gap` too low | Raise `-g` (e.g. 2.0–4.0) |
-| Output squished (rectangular pixels) | Asymmetric virtual pixel detection | Add `-q --square` |
-| `-q` causes too many edges | Irregular mode subdividing instead of padding | Ensure using `-i` with `-q`; the padded sampler is only active in non-tiled irregular mode |
-| Grid phase drifts across image | AI generation skewed the grid locally | Add `-t 64x64` (or similar tile size) |
-| Regular grid gives wrong count | Period estimation misled by dominant boundary | Try `-i` to use span detection directly |
-| Results change a lot with small `-p` changes | Single-threshold fragility | Use `resize2.py` (consensus is robust across thresholds) |
-| Breaks missed on sparse sprites | Global 1D projection dilutes signal | Use `detect2.py` / `resize2.py` (2D strip refinement) |
-| Output colours look washed / blended | Anti-aliased virtual-pixel boundaries sampled | Use `resize2.py` (boundary-trimmed sampling) |
+| Too few breaks / boundaries missed | Threshold too high or min-edge too high | Lower `-p` or `-e` |
+| Wide pixels over-subdivided | `--max-gap` too low | Raise `-g` (e.g. 2.0–4.0) |
+| Closely-spaced breaks merged into one | `--cluster-radius` too high | Lower `-c` to 1 |
+| Two adjacent breaks detected as one | `--min-distance` too high | Lower `-d` |
+| Output squished (rectangular pixels) | Asymmetric virtual pixel detection | Add `-q` |
+| `-q` with wrong pixel count | Regular mode selected but pixels are irregular | Add `-i` to force irregular + `-q` |
+| Output colors washed / blended | Anti-aliased virtual-pixel boundaries sampled | Use `-m center` or `-m max` instead of `center_region` |
+| Small feature breaks not detected | Feature too narrow for global normalization | Already handled by band-based detection; try lowering `-p` |
+| Breaks only partially correct | Mixed regular/irregular content | Use `-i` to rely on raw detected spans |
