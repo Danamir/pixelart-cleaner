@@ -19,7 +19,7 @@ Options:
     -p P --edge-percentile=P    Per-pixel luma-diff percentile threshold [default: 85].
     --palette-colors=N          Max colours for palette report [default: 256].
     -g R --max-gap=R            Max gap ratio before subdividing [default: 1.6].
-    -t T --regular-tolerance=T  Span-size tolerance for regularity check (0-1) [default: 0.10].
+    -t T --regular-tolerance=T  Max coefficient of variation (std/median) for regularity [default: 0.20].
     -e E --min-edge=E           Minimum absolute luma difference to count as an edge (0-255).
                                 Prevents near-zero thresholds on flat/sparse backgrounds [default: 10].
     -d D --min-distance=D       Minimum distance in px between two peaks in the break profile.
@@ -203,10 +203,9 @@ def breaks_to_span_sizes(breaks: np.ndarray, image_length: int) -> np.ndarray:
 
 
 def analyze_regularity(
-    span_sizes: np.ndarray,
-    tolerance_frac: float = 0.10,
-    outlier_ratio: float = 3.0,
-    min_close_frac: float = 0.80,
+    spacings: np.ndarray,
+    tolerance_frac: float = 0.20,
+    outlier_ratio: float = 1.6,
 ) -> tuple[bool, float]:
     """
     Determine whether detected virtual pixel sizes indicate a regular grid.
@@ -214,26 +213,30 @@ def analyze_regularity(
     1. Compute median span size.
     2. Filter out spans > outlier_ratio * median (art gaps, not vp boundaries).
     3. Re-compute median on the filtered set.
-    4. If >= min_close_frac of filtered spans are within tolerance_frac of
-       the new median, the grid is considered regular.
+    4. Compute coefficient of variation (std / median) on the filtered set.
+       If CV <= tolerance_frac, the grid is considered regular.
+
+    Using CV rather than a count-within-band avoids a hard integer-rounding
+    failure on small virtual pixels: a 5 px grid with ±1 px detection noise
+    has CV ≈ 0.10–0.14, well within the default 0.20 threshold, whereas the
+    old ±10% band check required spans to be exactly the median value.
 
     Returns (is_regular, median_size).
     """
-    if len(span_sizes) == 0:
+    if len(spacings) == 0:
         return False, 0.0
 
-    median = float(np.median(span_sizes))
+    median = float(np.median(spacings))
     if median < 2.0:
         return False, median
 
-    filtered = span_sizes[span_sizes <= outlier_ratio * median]
+    filtered = spacings[spacings <= outlier_ratio * median]
     if len(filtered) == 0:
         return False, median
 
     median = float(np.median(filtered))
-    close = np.abs(filtered - median) / median <= tolerance_frac
-    is_regular = float(close.mean()) >= min_close_frac
-    return is_regular, median
+    cv = float(filtered.std() / median) if median > 0 else 1.0
+    return cv <= tolerance_frac, median
 
 
 # ---------------------------------------------------------------------------
@@ -347,8 +350,11 @@ def detect_pixel_grid_v3(
                                       min_luma_diff=min_luma_diff,
                                       cluster_radius=cluster_radius,
                                       min_distance=min_distance)
-    row_sizes = breaks_to_span_sizes(row_breaks, H)
-    is_regular_h, pixel_h = analyze_regularity(row_sizes, regular_tolerance)
+    if len(row_breaks) >= 2:
+        row_spacings = np.diff(np.sort(row_breaks.astype(float)))
+        is_regular_h, pixel_h = analyze_regularity(row_spacings, regular_tolerance, max_gap_ratio)
+    else:
+        is_regular_h, pixel_h = False, 0.0
     row_synth = np.array([], dtype=float)
     if pixel_h > 2.0:
         row_breaks = remove_close_breaks(row_breaks, pixel_h)
@@ -361,8 +367,11 @@ def detect_pixel_grid_v3(
                                       min_luma_diff=min_luma_diff,
                                       cluster_radius=cluster_radius,
                                       min_distance=min_distance)
-    col_sizes = breaks_to_span_sizes(col_breaks, W)
-    is_regular_w, pixel_w = analyze_regularity(col_sizes, regular_tolerance)
+    if len(col_breaks) >= 2:
+        col_spacings = np.diff(np.sort(col_breaks.astype(float)))
+        is_regular_w, pixel_w = analyze_regularity(col_spacings, regular_tolerance, max_gap_ratio)
+    else:
+        is_regular_w, pixel_w = False, 0.0
     col_synth = np.array([], dtype=float)
     if pixel_w > 2.0:
         col_breaks = remove_close_breaks(col_breaks, pixel_w)

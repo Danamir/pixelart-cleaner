@@ -18,7 +18,7 @@ Options:
     -d D --min-distance=D       Minimum distance in px between two peaks in the break profile [default: 3].
     -c C --cluster-radius=C     Max distance in px to merge nearby band votes into one break [default: 1].
     -g R --max-gap=R            Max gap ratio before subdividing [default: 1.6].
-    --regular-tolerance=T       Span-size tolerance for regularity check (0-1) [default: 0.10].
+    --regular-tolerance=T       Max coefficient of variation (std/median) for regularity [default: 0.20].
     -r --force-regular          Always use regular grid strategy.
     -i --force-irregular        Always use irregular span strategy.
     -s S --scale=S              Divide detected pixel size by S (S>1 finer, S<1 coarser) [default: 1.0].

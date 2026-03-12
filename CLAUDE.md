@@ -92,7 +92,7 @@ Converts break positions to span sizes (pixel distances between consecutive brea
 1. Computes median span size.
 2. Filters out spans > 3× median (wide art gaps that are not virtual pixel boundaries).
 3. Re-computes median on the filtered set.
-4. If ≥ 80% of filtered spans are within `--regular-tolerance` (default ±10%) of the median, the axis is classified as **regular**.
+4. Computes the coefficient of variation `CV = std / median` on the filtered spans. If `CV ≤ --regular-tolerance` (default 0.20), the axis is classified as **regular**.
 
 Returns `(is_regular, median_size)`.
 
@@ -177,7 +177,7 @@ Note: tiled mode is best suited for irregular grids. Output tiles are assembled 
 | `--edge-percentile=P` | `-p` | 85 | Luma-diff percentile threshold; raise to ignore weaker boundaries |
 | `--palette-colors=N` | | 256 | Max colors for palette count report |
 | `--max-gap=R` | `-g` | 1.6 | Max gap ratio before gap-filling subdivides a span |
-| `--regular-tolerance=T` | `-t` | 0.10 | Span-size tolerance for regularity check (±fraction of median) |
+| `--regular-tolerance=T` | `-t` | 0.20 | Max CV (std/median) of span sizes for regularity; raise to be more permissive |
 | `--min-edge=E` | `-e` | 10 | Minimum absolute luma diff to count as an edge; prevents collapse on flat backgrounds |
 | `--min-distance=D` | `-d` | 3 | Minimum px between two break peaks; lower to detect closely-spaced boundaries |
 | `--cluster-radius=C` | `-c` | 1 | Max px to merge nearby band votes into one break; lower to preserve close breaks |
@@ -193,7 +193,7 @@ Note: tiled mode is best suited for irregular grids. Output tiles are assembled 
 | `--min-distance=D` | `-d` | 3 | Minimum px between break peaks |
 | `--cluster-radius=C` | `-c` | 1 | Max px to merge band votes |
 | `--max-gap=R` | `-g` | 1.6 | Max gap ratio before gap-filling |
-| `--regular-tolerance=T` | | 0.10 | Span-size tolerance for regularity check |
+| `--regular-tolerance=T` | | 0.20 | Max CV (std/median) of span sizes for regularity |
 | `--force-regular` | `-r` | off | Always use regular grid strategy |
 | `--force-irregular` | `-i` | off | Always use irregular span strategy |
 | `--scale=S` | `-s` | 1.0 | Divide detected pixel size by S (S>1 → finer grid) |
