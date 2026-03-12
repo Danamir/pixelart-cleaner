@@ -470,6 +470,47 @@ def _downsample_tiled(
 
 
 # ---------------------------------------------------------------------------
+# Tile boundary overlay
+# ---------------------------------------------------------------------------
+
+def draw_tile_boundaries(
+    img: Image.Image,
+    tile_w: int,
+    tile_h: int,
+    color: tuple[int, int, int] = (50, 220, 50),
+    dot: int = 4,
+    gap: int = 4,
+    alpha: float = 0.9,
+) -> Image.Image:
+    """
+    Draw tile boundaries as green dotted lines over an image.
+
+    Lines are drawn at multiples of tile_w (vertical) and tile_h (horizontal),
+    excluding the image edges.  Each line alternates `dot` filled pixels with
+    `gap` transparent pixels along its length.
+    """
+    arr = np.array(img, dtype=np.float32)
+    H, W = arr.shape[:2]
+    c = np.array(color, dtype=np.float32)
+
+    # Boolean mask of "filled" positions along a line of the given length
+    def _dot_mask(length: int) -> np.ndarray:
+        idx = np.arange(length)
+        return (idx // dot) % 2 == 0
+
+    h_mask = _dot_mask(W)   # which columns are filled on horizontal lines
+    v_mask = _dot_mask(H)   # which rows    are filled on vertical lines
+
+    for row in np.arange(tile_h, H, tile_h):
+        arr[row, h_mask] = arr[row, h_mask] * (1 - alpha) + c * alpha
+
+    for col in np.arange(tile_w, W, tile_w):
+        arr[v_mask, col] = arr[v_mask, col] * (1 - alpha) + c * alpha
+
+    return Image.fromarray(arr.clip(0, 255).astype(np.uint8))
+
+
+# ---------------------------------------------------------------------------
 # Comparison images
 # ---------------------------------------------------------------------------
 
@@ -700,6 +741,8 @@ def process_file(
 
     if verbose:
         edges_img        = make_grid_overlay(img, eff_col_breaks, eff_row_breaks)
+        if tile_size is not None:
+            edges_img = draw_tile_boundaries(edges_img, tile_size[0], tile_size[1])
         compare_img      = make_compare(out_img, W, H)
         compare_true_img = make_compare_true(out_img, W, H)
 
