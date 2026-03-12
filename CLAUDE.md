@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Two Python scripts to convert AI-generated pixel-art images into true pixel-art images by detecting the virtual pixel grid and downscaling to the real pixel-art resolution.
+Python scripts to convert AI-generated pixel-art images into true pixel-art images by detecting the virtual pixel grid and downscaling to the real pixel-art resolution. Two generations exist: v1 (`detect.py` / `resize.py`) and v2 (`detect2.py` / `resize2.py`) with improved detection algorithms.
 
 ### Problem Statement
 
@@ -29,10 +29,12 @@ AI-generated pixel art is approximative: colors within a single "virtual pixel" 
 
 ```bash
 # Grid detection only (produces annotated edge overlay)
-venv/Scripts/python.exe detect.py <input> [options]
+venv/Scripts/python.exe detect.py <input> [options]     # v1
+venv/Scripts/python.exe detect2.py <input> [options]    # v2 (consensus)
 
 # Downsampling (main tool)
-venv/Scripts/python.exe resize.py <input>... [options]
+venv/Scripts/python.exe resize.py <input>... [options]  # v1
+venv/Scripts/python.exe resize2.py <input>... [options] # v2 (consensus + trimmed sampling)
 ```
 
 Install dependencies:
@@ -47,8 +49,10 @@ venv/Scripts/pip.exe install -r requirements.txt
 pixelart-cleaner/
 ├── CLAUDE.md
 ├── requirements.txt
-├── detect.py        # Grid detection + edge overlay output
-├── resize.py        # Downsampling using detected grid
+├── detect.py        # v1: Grid detection + edge overlay output
+├── resize.py        # v1: Downsampling using detected grid
+├── detect2.py       # v2: Improved detection (consensus, adaptive fill, 2D refinement)
+├── resize2.py       # v2: Downsampling with v2 detection + trimmed sampling
 └── venv/            # Virtual environment (not committed)
 ```
 
@@ -117,6 +121,80 @@ Spans are attributed to tiles by their center pixel to avoid double-counting at 
 
 ---
 
+## Algorithm — detect2.py (v2)
+
+Addresses three limitations of v1's detection:
+1. Single-threshold fragility (one `--edge-percentile` controls everything)
+2. Gap-filling requires a global period (fails entirely in irregular mode)
+3. Global 1D projection dilutes breaks that only span part of the image
+
+`detect2.py` imports utility functions from `detect.py` and adds three new stages.
+
+### Step 1: Multi-threshold consensus (`consensus_break_positions`)
+
+Instead of detecting breaks at a single percentile, runs `compute_break_profile` + `find_break_positions` at **7 thresholds** evenly spread over a 30-point percentile range (e.g. 70–100 when center is 85).
+
+Peaks from all thresholds are clustered by proximity (radius 2 px). Each cluster counts how many **distinct thresholds** produced a peak in that neighbourhood. Only clusters with votes from >= 40% of thresholds (minimum 2) survive.
+
+Genuine virtual-pixel boundaries produce strong gradient peaks that persist across many thresholds. Noise and anti-aliasing artefacts only fire at the lowest thresholds and are filtered out.
+
+### Step 2: Period estimation + adaptive gap-filling (`adaptive_fill_breaks`)
+
+Period estimation reuses v1's integer art-size sweep on the (now higher-quality) consensus breaks.
+
+**Key improvement**: when period estimation fails (returns `None`), v1 skips gap-filling entirely. V2 falls back to the **median inter-break spacing** as an approximate period, then runs the same `_fill_missing_breaks` logic. This enables gap-filling in irregular mode where v1 could not.
+
+### Step 3: 2D strip-based refinement (`refine_breaks_2d`)
+
+After independent 1D detection for both axes, v2 cross-validates using the perpendicular axis:
+
+- **Column break refinement**: slices the image into horizontal strips (between row breaks). Within each strip, runs column break detection independently. Positions appearing in >= 2 strips (or >= 1/3 of strips, whichever is smaller) that aren't already detected are added.
+
+- **Row break refinement**: same logic using vertical strips (between column breaks).
+
+This catches breaks that the global 1D projection dilutes — e.g. a vertical boundary that only spans a small sprite on a large uniform background. The per-strip projection concentrates the signal.
+
+### Pipeline order
+
+1. Consensus breaks (both axes)
+2. Period estimation (integer art-size sweep)
+3. Remove close duplicates (if period known)
+4. Adaptive gap-filling (global period or median-spacing fallback)
+5. 2D strip-based refinement
+6. Final duplicate cleanup
+
+---
+
+## Algorithm — resize2.py (v2)
+
+`resize2.py` monkey-patches `resize.py` at import time, replacing two components:
+
+### Detection patch
+
+Replaces `detect_pixel_grid` with `detect_pixel_grid_v2` in the `resize` module namespace. Because Python resolves module-level names at call time, this affects all code paths including `_downsample_tiled`'s per-tile detection.
+
+### Boundary-trimmed sampling
+
+AI generators often anti-alias virtual-pixel edges, blending colours from neighbouring pixels into a 1–2 px border zone. V2 replaces `_sample_block` with a trimmed version that **excludes the outer ~15% of each block edge** (for blocks >= 5 px) before sampling. This avoids pulling blended boundary colours into the output.
+
+The trim fraction is fixed at 0.15. It applies to all sampling methods (center, mean, median) in irregular mode, and to `_downsample_square_padded`.
+
+All CLI options are identical to `resize.py`.
+
+---
+
+## v1 vs v2: when to use which
+
+| Scenario | Recommendation |
+|---|---|
+| Well-behaved regular grid (uniform pixel sizes) | v1 and v2 produce similar results; either works |
+| Irregular pixel sizes, period estimation fails | v2 — adaptive gap-filling uses median spacing as fallback |
+| Sparse sprite on large background | v2 — 2D strip refinement catches diluted breaks |
+| Threshold-sensitive image (results vary with `-p`) | v2 — consensus is robust across a range of thresholds |
+| Anti-aliased / blurry virtual-pixel boundaries | v2 — trimmed sampling avoids boundary colour bleed |
+
+---
+
 ## CLI Options Reference
 
 ### detect.py
@@ -128,6 +206,10 @@ Spans are attributed to tiles by their center pixel to avoid double-counting at 
 | `--palette-colors=N` | 256 | Max colors for palette quantization report |
 | `-g R` / `--max-gap=R` | 1.6 | Max gap ratio before subdividing; increase to allow wider virtual pixels |
 | `--edge-only` | off | Output black/white grid instead of color overlay |
+
+### detect2.py
+
+Same options as `detect.py`. Default output path is `<input>_edges2.png`. The `--edge-percentile` value serves as the **center** of the consensus range (actual thresholds span center +/- 15 percentile points).
 
 ### resize.py
 
@@ -154,6 +236,10 @@ Spans are attributed to tiles by their center pixel to avoid double-counting at 
 | `<stem>_compare_true.png` | Output scaled up by largest integer factor |
 
 Verbose filenames encode active non-default options, e.g. `ship_pixel_i_q_g3_p90.png`.
+
+### resize2.py
+
+Same CLI options as `resize.py`. Uses v2 detection and boundary-trimmed sampling automatically.
 
 ---
 
@@ -187,3 +273,6 @@ venv/Scripts/python.exe resize.py image.png -i -q -g 3.0
 | `-q` causes too many edges | Irregular mode subdividing instead of padding | Ensure using `-i` with `-q`; the padded sampler is only active in non-tiled irregular mode |
 | Grid phase drifts across image | AI generation skewed the grid locally | Add `-t 64x64` (or similar tile size) |
 | Regular grid gives wrong count | Period estimation misled by dominant boundary | Try `-i` to use span detection directly |
+| Results change a lot with small `-p` changes | Single-threshold fragility | Use `resize2.py` (consensus is robust across thresholds) |
+| Breaks missed on sparse sprites | Global 1D projection dilutes signal | Use `detect2.py` / `resize2.py` (2D strip refinement) |
+| Output colours look washed / blended | Anti-aliased virtual-pixel boundaries sampled | Use `resize2.py` (boundary-trimmed sampling) |
