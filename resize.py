@@ -20,7 +20,7 @@ In addition to the downsampled pixel-art output, two comparison images are saved
 
 Usage:
     resize.py <input>... [--output=PATH] [--edge-percentile=P] [--sample=METHOD]
-              [--force-regular | --force-irregular] [--scale=S] [--tile=SIZE] [-v]
+              [-r | -i] [-s S] [-t SIZE] [-v]
     resize.py -h | --help
 
 Arguments:
@@ -30,10 +30,10 @@ Options:
     -o PATH --output=PATH       Output image path (default: <input>_pixel.<ext>).
     --edge-percentile=P         Gradient percentile threshold for break detection [default: 85].
     --sample=METHOD             Sampling method for irregular grids: center, mean, median [default: center].
-    --force-regular             Force regular-grid strategy regardless of detection quality.
-    --force-irregular           Force irregular span-based strategy regardless of detection quality.
-    --scale=S                   Divide detected virtual pixel size by S before resampling [default: 1.0].
-    --tile=SIZE                 Split image into tiles of SIZE (e.g. 64x64) and detect each independently.
+    -r --force-regular          Force regular-grid strategy regardless of detection quality.
+    -i --force-irregular        Force irregular span-based strategy regardless of detection quality.
+    -s S --scale=S              Divide detected virtual pixel size by S before resampling [default: 1.0].
+    -t SIZE --tile=SIZE         Split image into tiles of SIZE (e.g. 64x64) and detect each independently.
                                 The global period is kept; only the phase is corrected per tile.
     -v --verbose                Also save _edges.png, _compare.png, and _compare_true.png.
     -h --help                   Show this screen.
@@ -164,6 +164,33 @@ def _regular_centers(
         max(0, min(image_length - 1, round((bounds[i] + bounds[i + 1]) / 2.0)))
         for i in range(len(bounds) - 1)
     ]
+
+
+# ---------------------------------------------------------------------------
+# Span subdivision (for --scale with irregular mode)
+# ---------------------------------------------------------------------------
+
+def _subdivide_spans(
+    spans: list[tuple[int, int]],
+    target_size: float,
+) -> list[tuple[int, int]]:
+    """
+    Split each span into sub-spans of approximately target_size pixels.
+
+    Used to apply --scale in irregular mode: each detected virtual-pixel span
+    is divided into round(span_size / target_size) equal sub-spans so that
+    the output pixel count matches the scaled resolution.
+    """
+    result = []
+    for s, e in spans:
+        n = max(1, round((e - s) / target_size))
+        step = (e - s) / n
+        for i in range(n):
+            sub_s = round(s + i * step)
+            sub_e = round(s + (i + 1) * step)
+            if sub_e > sub_s:
+                result.append((sub_s, sub_e))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +413,33 @@ def make_compare_true(pixel_img: Image.Image, orig_W: int, orig_H: int) -> Image
 
 
 # ---------------------------------------------------------------------------
+# Verbose filename suffix
+# ---------------------------------------------------------------------------
+
+def _flags_suffix(
+    force_regular: bool,
+    force_irregular: bool,
+    scale: float,
+    tile_size: tuple[int, int] | None,
+) -> str:
+    """
+    Build a filename suffix encoding the active non-default options, e.g.
+    '_r_s2.0_t16x16'.  Returns an empty string when all options are at
+    their defaults.
+    """
+    parts = []
+    if force_regular:
+        parts.append("r")
+    if force_irregular:
+        parts.append("i")
+    if scale != 1.0:
+        parts.append(f"s{scale}")
+    if tile_size is not None:
+        parts.append(f"t{tile_size[0]}x{tile_size[1]}")
+    return ("_" + "_".join(parts)) if parts else ""
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
@@ -427,6 +481,7 @@ def process_file(
     scale: float,
     verbose: bool,
     tile_size: tuple[int, int] | None = None,
+    flags_suffix: str = "",
 ) -> None:
     print(f"Loading: {input_path}")
     img, arr = load_image(str(input_path))
@@ -496,6 +551,10 @@ def process_file(
         strategy = f"irregular (span {sample_method} sampling)"
         row_spans = _breaks_to_spans(row_breaks, H)
         col_spans = _breaks_to_spans(col_breaks, W)
+        if scale != 1.0 and pixel_h is not None:
+            row_spans = _subdivide_spans(row_spans, pixel_h)
+        if scale != 1.0 and pixel_w is not None:
+            col_spans = _subdivide_spans(col_spans, pixel_w)
         if len(row_spans) != art_h:
             print(f"  Warning: {len(row_spans)} row spans detected, expected {art_h}")
         if len(col_spans) != art_w:
@@ -514,9 +573,9 @@ def process_file(
         compare_img      = make_compare(out_img, W, H)
         compare_true_img = make_compare_true(out_img, W, H)
 
-        edges_path        = input_path.parent / (input_path.stem + "_edges.png")
-        compare_path      = input_path.parent / (input_path.stem + "_compare.png")
-        compare_true_path = input_path.parent / (input_path.stem + "_compare_true.png")
+        edges_path        = input_path.parent / (input_path.stem + f"_edges{flags_suffix}.png")
+        compare_path      = input_path.parent / (input_path.stem + f"_compare{flags_suffix}.png")
+        compare_true_path = input_path.parent / (input_path.stem + f"_compare_true{flags_suffix}.png")
         print(f"Saving: {edges_path}")
         edges_img.save(str(edges_path))
         print(f"Saving: {compare_path}")
@@ -568,9 +627,11 @@ def main() -> None:
             print(f"Error: file not found: {p}", file=sys.stderr)
         sys.exit(1)
 
+    suffix = _flags_suffix(force_regular, force_irregular, scale, tile_size) if verbose else ""
+
     for input_path in input_paths:
         output_path = Path(output_arg) if output_arg else (
-            input_path.parent / (input_path.stem + "_pixel.png")
+            input_path.parent / (input_path.stem + f"_pixel{suffix}.png")
         )
         process_file(
             input_path, output_path,
@@ -578,6 +639,7 @@ def main() -> None:
             force_regular, force_irregular,
             scale, verbose,
             tile_size,
+            suffix,
         )
 
 
