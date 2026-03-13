@@ -98,6 +98,8 @@ resize <input>... [options]
 | `--tile=SIZE` | `-t` | off | Process in independent tiles, e.g. `64x64` |
 | `--sample=METHOD` | `-m` | `center` | Sampling method: `center`, `center_region`, `max` |
 | `--no-square` | `-q` | off | Disable square output pixels (on by default) |
+| `--remove-background` | `-b` | off | Detect and remove background color using corner sampling |
+| `--background-tolerance=B` | | 0.25 | Per-channel color tolerance for background detection (0–1) |
 | `--verbose` | `-v` | off | Also save `_edges.png`, `_compare.png`, `_compare_true.png` |
 
 #### Sampling methods
@@ -116,6 +118,7 @@ resize <input>... [options]
 | `<stem>_edges.png` | Detected grid overlaid on source |
 | `<stem>_compare.png` | Output scaled back to original dimensions (nearest-neighbour) |
 | `<stem>_compare_true.png` | Output scaled up by largest integer factor that fits |
+| `<stem>_pixel_background.png` | Pre-removal pixel image (only when `-b` and `-v` are both active and background is detected) |
 
 Verbose filenames encode active non-default options, e.g. `ship_i_q_g3_p90_pixel.png`.
 

@@ -25,11 +25,14 @@ Options:
     -t SIZE --tile=SIZE         Process in independent tiles, e.g. 64x64.
     -m METHOD --sample=METHOD   Color sampling method: center, center_region, max [default: center].
     -q --no-square              Disable square output pixels (square is on by default).
+    -b --remove-background      Detect and remove background color using corner sampling.
+    --background-tolerance=B    Per-channel color tolerance for background detection (0-1) [default: 0.25].
     -v --verbose                Also save _edges, _compare, _compare_true images.
     -h --help                   Show this screen.
 """
 
 import sys
+from collections import deque
 from math import ceil
 from pathlib import Path
 
@@ -415,6 +418,86 @@ def make_tiled_grid_overlay(
 
 
 # ---------------------------------------------------------------------------
+# Background removal
+# ---------------------------------------------------------------------------
+
+def _detect_background_color(arr: np.ndarray, tolerance: float) -> np.ndarray | None:
+    """
+    Sample the 4 corners of a float32 RGB array.
+
+    If at least 2 corners share the same color within tolerance (fraction of
+    255 per channel, checked with max-channel distance), return their mean as
+    the background color.  Returns None if no pair agrees.
+    """
+    H, W = arr.shape[:2]
+    corners = [
+        arr[0,     0    ].astype(float),
+        arr[0,     W - 1].astype(float),
+        arr[H - 1, 0    ].astype(float),
+        arr[H - 1, W - 1].astype(float),
+    ]
+    thresh = tolerance * 255.0
+    for i in range(4):
+        for j in range(i + 1, 4):
+            if np.max(np.abs(corners[i] - corners[j])) <= thresh:
+                return (corners[i] + corners[j]) / 2.0
+    return None
+
+
+def _flood_fill_background(arr: np.ndarray, bg_color: np.ndarray, tolerance: float) -> np.ndarray:
+    """
+    BFS flood fill to remove background, in two passes.
+
+    Pass 1: seed from the 4 corners that match bg_color.
+    Pass 2: scan all perimeter pixels; any unvisited pixel that matches
+            bg_color is added as an additional seed.
+
+    All connected matching pixels are set to (0, 0, 0, 0).
+    Returns an RGBA uint8 array.
+    """
+    H, W = arr.shape[:2]
+    thresh = tolerance * 255.0
+
+    rgba = np.zeros((H, W, 4), dtype=np.uint8)
+    rgba[:, :, :3] = arr.clip(0, 255).astype(np.uint8)
+    rgba[:, :, 3] = 255
+
+    visited = np.zeros((H, W), dtype=bool)
+    queue: deque[tuple[int, int]] = deque()
+
+    def _enqueue(r: int, c: int) -> None:
+        if not visited[r, c] and np.max(np.abs(arr[r, c].astype(float) - bg_color)) <= thresh:
+            visited[r, c] = True
+            queue.append((r, c))
+
+    def _bfs() -> None:
+        while queue:
+            r, c = queue.popleft()
+            rgba[r, c] = 0  # fully transparent
+            for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                if 0 <= nr < H and 0 <= nc < W:
+                    _enqueue(nr, nc)
+
+    # Pass 1: corners
+    for r, c in [(0, 0), (0, W - 1), (H - 1, 0), (H - 1, W - 1)]:
+        _enqueue(r, c)
+    _bfs()
+
+    # Pass 2: remaining perimeter pixels
+    perimeter = (
+        [(0, c) for c in range(W)]
+        + [(H - 1, c) for c in range(W)]
+        + [(r, 0) for r in range(1, H - 1)]
+        + [(r, W - 1) for r in range(1, H - 1)]
+    )
+    for r, c in perimeter:
+        _enqueue(r, c)
+    _bfs()
+
+    return rgba
+
+
+# ---------------------------------------------------------------------------
 # Verbose output helpers
 # ---------------------------------------------------------------------------
 
@@ -427,6 +510,8 @@ def _build_output_stem(stem: str, args: dict) -> str:
         suffix += "_r"
     if args["--no-square"]:
         suffix += "_nq"
+    if args["--remove-background"]:
+        suffix += "_b"
     g = float(args["--max-gap"])
     if g != 1.6:
         suffix += f"_g{g:g}"
@@ -492,6 +577,8 @@ def main() -> None:
     force_irregular = args["--force-irregular"]
     scale = float(args["--scale"])
     square = not args["--no-square"]
+    remove_background = args["--remove-background"]
+    bg_tolerance = float(args["--background-tolerance"])
     verbose = args["--verbose"]
     tile_size = args["--tile"]
 
@@ -553,17 +640,32 @@ def main() -> None:
         out_h, out_w = out_arr.shape[:2]
         print(f"  Output: {out_w} x {out_h} px")
 
-        # Save main output
-        out_pil = Image.fromarray(out_arr.clip(0, 255).astype(np.uint8))
-        out_pil.save(str(output_path))
-        print(f"  Saved: {output_path}")
-
-        # Verbose outputs
+        # Verbose outputs (saved before background removal, on raw pixel data)
         if verbose:
             vstem = _build_output_stem(input_path.stem, args)
             overlay = tiled_overlay if tile_size else None
             _save_verbose(img, out_arr, col_breaks, row_breaks, col_synth, row_synth,
                           vstem, input_path.parent, edges_overlay=overlay)
+
+        # Save main output (with optional background removal)
+        if remove_background:
+            bg_color = _detect_background_color(out_arr, bg_tolerance)
+            if bg_color is not None:
+                if verbose:
+                    vstem = _build_output_stem(input_path.stem, args)
+                    bg_ref_path = input_path.parent / (vstem + "_pixel_background.png")
+                    Image.fromarray(out_arr.clip(0, 255).astype(np.uint8)).save(str(bg_ref_path))
+                    print(f"  Saved: {bg_ref_path}")
+                rgba_arr = _flood_fill_background(out_arr, bg_color, bg_tolerance)
+                out_pil = Image.fromarray(rgba_arr, mode="RGBA")
+                print(f"  Background removed: RGB({bg_color[0]:.0f}, {bg_color[1]:.0f}, {bg_color[2]:.0f})")
+            else:
+                out_pil = Image.fromarray(out_arr.clip(0, 255).astype(np.uint8))
+                print("  Background not detected (no matching corner pair)")
+        else:
+            out_pil = Image.fromarray(out_arr.clip(0, 255).astype(np.uint8))
+        out_pil.save(str(output_path))
+        print(f"  Saved: {output_path}")
 
 
 if __name__ == "__main__":
