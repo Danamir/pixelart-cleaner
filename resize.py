@@ -24,7 +24,7 @@ Options:
     -s S --scale=S              Divide detected pixel size by S (S>1 finer, S<1 coarser) [default: 1.0].
     -t SIZE --tile=SIZE         Process in independent tiles, e.g. 64x64.
     -m METHOD --sample=METHOD   Color sampling method: center, center_region, max [default: center].
-    -q --square                 Force square output pixels.
+    -q --no-square              Disable square output pixels (square is on by default).
     -v --verbose                Also save _edges, _compare, _compare_true images.
     -h --help                   Show this screen.
 """
@@ -260,10 +260,8 @@ def _downsample_single(
         pixel_h /= scale
 
     # Decide strategy
-    both_regular = is_regular_w and is_regular_h
     use_regular = (
-        not force_irregular
-        and (force_regular or both_regular)
+        force_regular
         and pixel_w is not None
         and pixel_h is not None
     )
@@ -427,8 +425,8 @@ def _build_output_stem(stem: str, args: dict) -> str:
         suffix += "_i"
     if args["--force-regular"]:
         suffix += "_r"
-    if args["--square"]:
-        suffix += "_q"
+    if args["--no-square"]:
+        suffix += "_nq"
     g = float(args["--max-gap"])
     if g != 1.6:
         suffix += f"_g{g:g}"
@@ -493,7 +491,7 @@ def main() -> None:
     force_regular = args["--force-regular"]
     force_irregular = args["--force-irregular"]
     scale = float(args["--scale"])
-    square = args["--square"]
+    square = not args["--no-square"]
     verbose = args["--verbose"]
     tile_size = args["--tile"]
 
@@ -539,10 +537,12 @@ def main() -> None:
                 detect_pixel_grid_v3(arr, threshold_percentile, max_gap_ratio, regular_tolerance, min_luma_diff,
                                      min_distance=min_distance, cluster_radius=cluster_radius)
 
-            mode_str = "regular" if (is_regular_w and is_regular_h and not force_irregular) else "irregular"
+            mode_str = "regular" if force_regular else "irregular"
             print(f"  Mode: {mode_str}")
             if pixel_w:
                 print(f"  Virtual pixel size: ~{pixel_w:.2f} x {pixel_h:.2f} px")
+            if is_regular_w and is_regular_h and not force_regular:
+                print("  Hint: regular grid detected -- try --force-regular (-r) for potentially better results")
 
             out_arr = _downsample_single(
                 arr, threshold_percentile, max_gap_ratio, regular_tolerance,

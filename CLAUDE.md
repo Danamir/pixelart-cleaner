@@ -129,12 +129,11 @@ Returns 8 values:
 
 ### Grid strategy selection
 
-After detection, the strategy is chosen:
+The default strategy is always **Irregular**. If both axes are detected as regular, a hint is printed suggesting `--force-regular`. Strategy overrides:
 
 | Condition | Strategy |
 |---|---|
-| Both axes regular, no override | **Regular** |
-| Either axis irregular, or `--force-irregular` | **Irregular** |
+| Default (no override) | **Irregular** |
 | `--force-regular` | **Regular** (uses period even if irregular) |
 
 ### Regular strategy
@@ -199,7 +198,7 @@ Note: tiled mode is best suited for irregular grids. Output tiles are assembled 
 | `--scale=S` | `-s` | 1.0 | Divide detected pixel size by S (S>1 → finer grid) |
 | `--tile=SIZE` | `-t` | off | Process in independent tiles, e.g. `64x64` |
 | `--sample=METHOD` | `-m` | center | Sampling method: `center`, `center_region`, `max` |
-| `--square` | `-q` | off | Force square output pixels |
+| `--no-square` | `-q` | off | Disable square output pixels (square is on by default) |
 | `--verbose` | `-v` | off | Also save `_edges.png`, `_compare.png`, `_compare_true.png` |
 
 #### Verbose output files
@@ -215,22 +214,22 @@ Verbose filenames encode active non-default options, e.g. `ship_i_q_g3_p90_pixel
 
 ---
 
-## --square option in detail
+## --no-square option in detail
 
-`--square` / `-q` behavior differs by strategy:
+Square pixels are **on by default**. Pass `-q` / `--no-square` to disable.
 
-**Regular mode**: averages `pixel_w` and `pixel_h` into a single square period before placing grid centers.
-
-**Irregular mode** (`downsample_square_irregular`): each detected span is sampled **once**. Its color is then repeated `round(span_size / target_size)` times along its axis, where `target_size = min(pixel_w, pixel_h)`. This means:
+**Irregular mode** (default, `downsample_square_irregular`): each detected span is sampled **once**. Its color is then repeated `round(span_size / target_size)` times along its axis, where `target_size = min(pixel_w, pixel_h)`. This means:
 - A normal span (~`target_size` px) → 1 output pixel
 - A wide/tall span (2× target) → 2 identical adjacent output pixels
 - A very wide span preserved by `--max-gap` (3× target) → 3 identical output pixels
 
 No independent sub-sampling of sub-regions is done, so no spurious edge artefacts appear within a single virtual pixel.
 
+**Regular mode** (`--force-regular`): averages `pixel_w` and `pixel_h` into a single square period before placing grid centers.
+
 **Recommended combination for images with wide irregular pixels**:
 ```bash
-venv/Scripts/python.exe resize.py image.png -i -q -g 3.0
+venv/Scripts/python.exe resize.py image.png -g 3.0
 ```
 
 ---
@@ -273,8 +272,8 @@ venv/Scripts/python.exe resize.py image.png -i -q -g 3.0
 | Wide pixels over-subdivided | `--max-gap` too low | Raise `-g` (e.g. 2.0–4.0) |
 | Closely-spaced breaks merged into one | `--cluster-radius` too high | Lower `-c` to 1 |
 | Two adjacent breaks detected as one | `--min-distance` too high | Lower `-d` |
-| Output squished (rectangular pixels) | Asymmetric virtual pixel detection | Add `-q` |
-| `-q` with wrong pixel count | Regular mode selected but pixels are irregular | Add `-i` to force irregular + `-q` |
+| Output squished (rectangular pixels) | Square mode disabled | Remove `-q` (square is on by default) |
+| Square output has wrong pixel count | Irregular spans with very wide pixels | Raise `-g` (e.g. 2.0-4.0) |
 | Output colors washed / blended | Anti-aliased virtual-pixel boundaries sampled | Use `-m center` or `-m max` instead of `center_region` |
 | Small feature breaks not detected | Feature too narrow for global normalization | Already handled by band-based detection; try lowering `-p` |
 | Breaks only partially correct | Mixed regular/irregular content | Use `-i` to rely on raw detected spans |

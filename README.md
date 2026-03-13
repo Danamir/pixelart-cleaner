@@ -41,8 +41,8 @@ Output is always PNG regardless of input format.
 # Basic downsampling
 resize sprite.png
 
-# Irregular grid with square pixels and relaxed gap tolerance
-resize sprite.png -i -q -g 3.0
+# Relaxed gap tolerance for wide irregular pixels (square pixels on by default)
+resize sprite.png -g 3.0
 
 # Inspect the detected grid before downsampling
 detect sprite.png -o sprite_grid.png
@@ -97,7 +97,7 @@ resize <input>... [options]
 | `--scale=S` | `-s` | 1.0 | Divide detected pixel size by S (S>1 → finer grid) |
 | `--tile=SIZE` | `-t` | off | Process in independent tiles, e.g. `64x64` |
 | `--sample=METHOD` | `-m` | `center` | Sampling method: `center`, `center_region`, `max` |
-| `--square` | `-q` | off | Force square output pixels |
+| `--no-square` | `-q` | off | Disable square output pixels (on by default) |
 | `--verbose` | `-v` | off | Also save `_edges.png`, `_compare.png`, `_compare_true.png` |
 
 #### Sampling methods
@@ -121,13 +121,13 @@ Verbose filenames encode active non-default options, e.g. `ship_i_q_g3_p90_pixel
 
 ---
 
-## --square option (`-q`)
+## Square pixels (`--no-square` / `-q`)
 
-Forces square output pixels. Behavior differs depending on the grid strategy in use.
+Square output pixels are **on by default**. Pass `-q` / `--no-square` to disable.
 
-**Regular mode** (default when grid is uniform): averages the detected `pixel_w` and `pixel_h` into a single square period before placing grid centers.
+The default strategy is always **irregular** (raw detected spans). If a regular grid is detected, `resize` will print a hint suggesting `--force-regular` (`-r`) for potentially better results.
 
-**Irregular mode** (`-i`): each detected span is sampled once. Its color is then repeated `round(span_size / target_size)` times along its axis, where `target_size = min(pixel_w, pixel_h)`. This means:
+**Irregular mode** (default): each detected span is sampled once. Its color is repeated `round(span_size / target_size)` times along its axis, where `target_size = min(pixel_w, pixel_h)`. This means:
 
 - A normal span (~`target_size` px) → 1 output pixel
 - A wide/tall span (2× target) → 2 identical adjacent output pixels
@@ -135,9 +135,16 @@ Forces square output pixels. Behavior differs depending on the grid strategy in 
 
 No independent sub-sampling is done within a span, so no spurious edge artefacts appear inside a single virtual pixel.
 
+**Regular mode** (`-r`): averages the detected `pixel_w` and `pixel_h` into a single square period before placing grid centers.
+
 **Recommended combination for images with wide irregular pixels:**
 ```bash
-resize image.png -i -q -g 3.0
+resize image.png -g 3.0
+```
+
+**To disable square pixels:**
+```bash
+resize image.png -q
 ```
 
 ---
@@ -151,7 +158,7 @@ resize image.png -i -q -g 3.0
 | Wide pixels over-subdivided | `--max-gap` too low | Raise `-g` (e.g. 2.0–4.0) |
 | Closely-spaced breaks merged into one | `--cluster-radius` too high | Lower `-c` to 1 |
 | Two adjacent breaks detected as one | `--min-distance` too high | Lower `-d` |
-| Output squished (rectangular pixels) | Asymmetric virtual pixel detection | Add `-q` |
-| `-q` with wrong pixel count | Regular mode selected but pixels are irregular | Add `-i` to force irregular + `-q` |
+| Output squished (rectangular pixels) | Square mode disabled | Remove `-q` (square is on by default) |
+| Square output has wrong pixel count | Irregular spans with very wide pixels | Raise `-g` (e.g. 2.0–4.0) |
 | Output colors washed / blended | Anti-aliased boundaries sampled | Use `-m center` or `-m max` instead of `center_region` |
 | Breaks only partially correct | Mixed regular/irregular content | Use `-i` to rely on raw detected spans |
