@@ -22,8 +22,10 @@ AI-generated pixel art is approximative: colors within a single "virtual pixel" 
 ## Conventions
 
 - **Argument parsing**: use [`docopt-ng`](https://github.com/jazzband/docopt-ng). The CLI interface is defined by the module docstring; `docopt(__doc__)` parses it. Do **not** use `argparse`.
-- **Output format**: always PNG, regardless of input format.
-- **Short options**: every option that takes a value has a short form; boolean flags use long form only except `-r`, `-i`, `-q`, `-v`.
+- **Output format**: always PNG, regardless of input format (RGBA when `-b` removes a background, RGB otherwise).
+- **Short options**: most options that take a value have a short form. Exceptions: `--palette-colors` (detect.py), `--regular-tolerance` and `--background-tolerance` (resize.py). Boolean flags use long form only, except `-r`, `-i`, `-q`, `-b`, `-v`. Note that `-t` means `--regular-tolerance` in detect.py but `--tile` in resize.py.
+- **Console output**: ASCII only (`x`, `+/-`, `--`). The Windows console encoding breaks on Unicode symbols.
+- **Pillow**: use `get_flattened_data()`, not `getdata()` (Pillow >= 14).
 
 ## Running the Project
 
@@ -39,20 +41,27 @@ Install dependencies:
 
 ```bash
 venv/Scripts/pip.exe install -r requirements.txt
+# or install as a package, exposing `detect` and `resize` console scripts:
+venv/Scripts/pip.exe install -e .
 ```
+
+Dependencies: Pillow, numpy, scipy, docopt-ng. The code uses `X | None` annotations, so it needs Python 3.10+ (the venv runs 3.12).
 
 ## Project Structure
 
 ```
 pixelart-cleaner/
 ├── CLAUDE.md
+├── README.md        # User-facing documentation
+├── LICENCE          # GNU GPL v3
+├── pyproject.toml   # setuptools build; console scripts detect/resize
 ├── requirements.txt
 ├── detect.py        # Grid detection + edge overlay output
-├── resize.py        # Downsampling using detected grid
+├── resize.py        # Downsampling using detected grid (imports from detect.py)
 └── venv/            # Virtual environment (not committed)
 ```
 
-Test images live in `test.local/` (git-ignored via `*.local` pattern).
+Test images live in `test.local/` (git-ignored via `*.local` pattern). There is no automated test suite. Check changes against the cases in the **Debug** section.
 
 ---
 
@@ -87,14 +96,14 @@ Nearby surviving positions within `--cluster-radius` px (default 1) are merged i
 
 ### Step 5: Regularity analysis (`analyze_regularity`)
 
-Converts break positions to span sizes (pixel distances between consecutive breaks including image edges), then:
+Takes the spacings between consecutive detected breaks (`np.diff` of the sorted breaks; image edges are **not** included, and at least 2 breaks are required), then:
 
-1. Computes median span size.
-2. Filters out spans > 3× median (wide art gaps that are not virtual pixel boundaries).
+1. Computes median spacing. If it is < 2 px, the axis is irregular.
+2. Filters out spacings > `--max-gap` × median (default 1.6; wide art gaps that are not virtual pixel boundaries).
 3. Re-computes median on the filtered set.
-4. Computes the coefficient of variation `CV = std / median` on the filtered spans. If `CV ≤ --regular-tolerance` (default 0.20), the axis is classified as **regular**.
+4. Computes the coefficient of variation `CV = std / median` on the filtered spacings. If `CV ≤ --regular-tolerance` (default 0.20), the axis is classified as **regular**.
 
-Returns `(is_regular, median_size)`.
+Returns `(is_regular, median_size)`. (`breaks_to_span_sizes` exists in detect.py but is unused.)
 
 ### Step 6: Break refinement
 
@@ -120,8 +129,14 @@ Returns 8 values:
 
 ### Edge overlay output
 
-- **Color overlay** (default): detected breaks drawn over the original image. True breaks are solid lines (red = rows, blue = columns). Synthetic (gap-filled) breaks are drawn as dotted lines at lower alpha.
-- **Edge-only** (`--edge-only`): black background with white solid lines for true breaks, grey dotted lines for synthetic breaks.
+A break at gradient index `b` is drawn on pixel line `b + 1`.
+
+- **Color overlay** (default): detected breaks drawn over the original image (red = rows, blue = columns). True breaks use alpha 0.85, synthetic (gap-filled) breaks alpha 0.33.
+- **Edge-only** (`--edge-only`): black background, white lines for true breaks, grey (128) lines for synthetic breaks.
+
+Synthetic lines are solid because `_DOT_SIZE = 0`. Set it > 0 to draw them dotted.
+
+detect.py also prints a report with true and forged break counts, mean/std spacing, the estimated pixel-art resolution, and a palette color count (median-cut quantization, `--palette-colors`).
 
 ---
 
@@ -129,12 +144,15 @@ Returns 8 values:
 
 ### Grid strategy selection
 
-The default strategy is always **Irregular**. If both axes are detected as regular, a hint is printed suggesting `--force-regular`. Strategy overrides:
+The default strategy is always **Irregular**. If both axes are detected as regular, a hint is printed suggesting `--force-regular` (non-tiled mode only). Strategy overrides:
 
 | Condition | Strategy |
 |---|---|
 | Default (no override) | **Irregular** |
-| `--force-regular` | **Regular** (uses period even if irregular) |
+| `--force-regular` | **Regular** (uses period even if irregular; falls back to irregular if a period is undetectable) |
+| `--force-irregular` | Accepted but a no-op, since irregular is already the default |
+
+`--scale S` divides both detected periods by `S` before the strategy is applied.
 
 ### Regular strategy
 
@@ -162,7 +180,16 @@ Splits the image into tiles (e.g. `64x64`) and runs full detection independently
 
 The `_edges.png` verbose output in tiled mode shows per-tile detected breaks translated to global coordinates, with green lines at alpha 0.5 marking tile boundaries.
 
-Note: tiled mode is best suited for irregular grids. Output tiles are assembled with max-height/max-width padding per strip.
+Note: tiled mode is best suited for irregular grids. Output tiles are assembled with zero (black) padding to the max height/width per strip. A global detection pass also runs, only to report sizes and drive the non-tiled edges overlay.
+
+### Background removal (`--remove-background`)
+
+Applied to the **downsampled** output, not to the source image:
+
+1. `_detect_background_color`: samples the 4 corners of the output. If any pair matches within `--background-tolerance` × 255 (max per-channel distance), their mean is used as the background color. If no pair matches, nothing is removed.
+2. `_flood_fill_background`: BFS flood fill (4-connected) from the matching corners, then a second pass seeded from every matching perimeter pixel. Filled pixels become fully transparent `(0,0,0,0)`, and the output is saved as RGBA.
+
+Verbose images are saved from the pre-removal data. With `-v`, the pre-removal pixel image is also saved as `_pixel_background.png`.
 
 ---
 
@@ -186,7 +213,7 @@ Note: tiled mode is best suited for irregular grids. Output tiles are assembled 
 
 | Option | Short | Default | Description |
 |---|---|---|---|
-| `--output=PATH` | `-o` | `<stem>_pixel.png` | Output path |
+| `--output=PATH` | `-o` | `<stem>[suffixes]_pixel.png` | Output path (with multiple inputs, every input writes to this same path) |
 | `--edge-percentile=P` | `-p` | 85 | Luma-diff percentile threshold |
 | `--min-edge=E` | `-e` | 10 | Minimum absolute luma diff floor |
 | `--min-distance=D` | `-d` | 3 | Minimum px between break peaks |
@@ -194,7 +221,7 @@ Note: tiled mode is best suited for irregular grids. Output tiles are assembled 
 | `--max-gap=R` | `-g` | 1.6 | Max gap ratio before gap-filling |
 | `--regular-tolerance=T` | | 0.20 | Max CV (std/median) of span sizes for regularity |
 | `--force-regular` | `-r` | off | Always use regular grid strategy |
-| `--force-irregular` | `-i` | off | Always use irregular span strategy |
+| `--force-irregular` | `-i` | off | No-op (irregular is the default); kept for compatibility, adds `_i` to the output name |
 | `--scale=S` | `-s` | 1.0 | Divide detected pixel size by S (S>1 → finer grid) |
 | `--tile=SIZE` | `-t` | off | Process in independent tiles, e.g. `64x64` |
 | `--sample=METHOD` | `-m` | center | Sampling method: `center`, `center_region`, `max` |
@@ -213,7 +240,7 @@ Note: tiled mode is best suited for irregular grids. Output tiles are assembled 
 | `<stem>_compare_true.png` | Output scaled up by largest integer factor that fits |
 | `<stem>_pixel_background.png` | Pre-removal pixel image (only when `-b` and `-v` are both active and background is detected) |
 
-Verbose filenames encode active non-default options, e.g. `ship_i_q_g3_p90_pixel.png`.
+Output stems (main output too, unless `-o` is given) encode some non-default options, in this order: `_i` (force-irregular), `_r` (force-regular), `_nq` (no-square), `_b` (remove-background), `_g<R>` (max-gap ≠ 1.6), `_p<P>` (edge-percentile ≠ 85). Example: `ship_i_nq_g3_p90_pixel.png`. Other options (`-s`, `-t`, `-m`, `-e`, `-d`, `-c`) are not encoded.
 
 ---
 
@@ -279,4 +306,4 @@ venv/Scripts/python.exe resize.py image.png -g 3.0
 | Square output has wrong pixel count | Irregular spans with very wide pixels | Raise `-g` (e.g. 2.0-4.0) |
 | Output colors washed / blended | Anti-aliased virtual-pixel boundaries sampled | Use `-m center` or `-m max` instead of `center_region` |
 | Small feature breaks not detected | Feature too narrow for global normalization | Already handled by band-based detection; try lowering `-p` |
-| Breaks only partially correct | Mixed regular/irregular content | Use `-i` to rely on raw detected spans |
+| Breaks only partially correct | Mixed regular/irregular content | Avoid `-r` (default irregular mode uses raw detected spans), or try `-t 64x64` |
