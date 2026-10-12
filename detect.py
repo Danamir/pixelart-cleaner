@@ -33,7 +33,6 @@ Options:
 import sys
 from collections import Counter
 from pathlib import Path
-from math import ceil
 
 import numpy as np
 from docopt import docopt
@@ -316,7 +315,7 @@ def detect_pixel_grid_v3(
     arr: np.ndarray,
     threshold_percentile: float,
     max_gap_ratio: float = 1.6,
-    regular_tolerance: float = 0.10,
+    regular_tolerance: float = 0.20,
     min_luma_diff: float = 10.0,
     min_distance: int = 3,
     cluster_radius: int = 1,
@@ -328,8 +327,8 @@ def detect_pixel_grid_v3(
       1. Compute per-line-pair fraction of pixels exceeding luma-diff threshold.
       2. Find peaks in the fraction profile -> break positions.
       3. Compute span sizes between breaks.
-      4. Analyse regularity (median + 80% within tolerance).
-      5. If regular, fill missing breaks and remove duplicates.
+      4. Analyse regularity (CV of break spacings <= tolerance).
+      5. If a period > 2 px is found, remove duplicates and fill missing breaks.
 
     Returns
     -------

@@ -282,7 +282,7 @@ def _downsample_single(
         col_spans = spans_from_breaks(col_breaks, W)
         row_spans = spans_from_breaks(row_breaks, H)
         if square and pixel_w is not None and pixel_h is not None:
-            target = min(pixel_w, pixel_h) / scale
+            target = min(pixel_w, pixel_h)
             return downsample_square_irregular(arr, col_spans, row_spans, target, method)
         return downsample(arr, col_spans, row_spans, method)
 
